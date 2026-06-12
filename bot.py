@@ -326,6 +326,33 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts.append("עדיין בתחילת הדרך. ככל שנדבר יותר - אדע אותך יותר.")
     await update.message.reply_text("\n".join(parts))
 
+async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_allowed(update): return
+    user = update.effective_user
+    system_prompt = await build_system_prompt(user.id, user.first_name)
+    history = await get_recent_messages(user.id)
+    messages = [{"role": m["role"], "content": m["content"]} for m in history]
+    messages.append({"role": "user", "content": """סכם את התהליך שעברנו יחד עד עכשיו.
+כלול:
+- מה עלה בשיחות שלנו
+- מה השתנה או התפתח
+- דפוסים שזיהית
+- איפה אתה רואה אותי עכשיו
+- מה לדעתך צריך המשך עבודה
+
+דבר בגוף ראשון כפרנקל, בחום ובעומק. זה לא דוח - זה שיקוף אנושי."""})
+    await update.message.reply_text("רגע, אני מסכם את הדרך שעברנו...")
+    try:
+        response = anthropic_client.messages.create(
+            model=MODEL, max_tokens=800,
+            system=system_prompt,
+            messages=messages
+        )
+        await update.message.reply_text(response.content[0].text)
+    except Exception as e:
+        logger.error(f"Summary error: {e}")
+        await update.message.reply_text("סליחה, לא הצלחתי לייצר סיכום כרגע.")
+
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(db_execute, "DELETE FROM messages WHERE user_id = %s", (update.effective_user.id,))
     await update.message.reply_text("היסטוריית השיחה נמחקה. הזיכרון העמוק נשמר.")
@@ -335,6 +362,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /profile - מה שאני זוכר עליך
 /goals - היעדים שלך
 /events - אירועים שתיעדנו
+/summary - סיכום התהליך שעברנו
 /clear - מחיקת היסטוריית שיחה
 /help - עזרה""")
 
@@ -405,6 +433,7 @@ async def startup():
     bot_app.add_handler(CommandHandler("goals", cmd_goals))
     bot_app.add_handler(CommandHandler("events", cmd_events))
     bot_app.add_handler(CommandHandler("profile", cmd_profile))
+    bot_app.add_handler(CommandHandler("summary", cmd_summary))
     bot_app.add_handler(CommandHandler("clear", cmd_clear))
     bot_app.add_handler(CommandHandler("help", cmd_help))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
