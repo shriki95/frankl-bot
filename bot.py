@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 MODEL = "claude-sonnet-4-5"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "frankl2024secret")
+ALLOWED_USER_ID = 1126985722
 
 # ============================================================
 # PROMPTS
@@ -252,7 +253,14 @@ async def get_all_users(): return await asyncio.to_thread(_get_all_users)
 # BOT HANDLERS
 # ============================================================
 
+async def is_allowed(update: Update) -> bool:
+    if update.effective_user.id != ALLOWED_USER_ID:
+        await update.message.reply_text("הבוט הזה פרטי.")
+        return False
+    return True
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_allowed(update): return
     user = update.effective_user
     await save_user(user.id, user.first_name, user.username)
     await update.message.reply_text(f"""שלום {user.first_name}.
@@ -312,6 +320,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /help - עזרה""")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_allowed(update): return
     user = update.effective_user
     user_text = update.message.text
     await save_user(user.id, user.first_name, user.username)
