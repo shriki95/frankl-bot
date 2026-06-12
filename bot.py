@@ -232,13 +232,22 @@ def _save_insights(user_id, extraction):
 def _extract_and_save(user_id, user_message):
     try:
         response = anthropic_client.messages.create(
-            model=MODEL, max_tokens=300,
+            model="claude-haiku-4-5", max_tokens=400,
             system=EXTRACTION_PROMPT,
             messages=[{"role": "user", "content": user_message}]
         )
-        extraction = json.loads(response.content[0].text.strip())
+        text = response.content[0].text.strip()
+        # נקה markdown אם יש
+        text = text.replace("```json", "").replace("```", "").strip()
+        # מצא JSON בתוך הטקסט
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start != -1 and end > start:
+            text = text[start:end]
+        extraction = json.loads(text)
         if any(v for v in extraction.values() if v):
             _save_insights(user_id, extraction)
+            logger.info(f"Saved insights for user {user_id}: {extraction}")
     except Exception as e:
         logger.error(f"Extraction error: {e}")
 
