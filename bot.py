@@ -1,8 +1,9 @@
 import os
 import logging
 import json
-import threading
-import asyncpg
+import asyncio
+from urllib.parse import urlparse
+import pg8000.dbapi
 import anthropic
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -15,7 +16,6 @@ logger = logging.getLogger(__name__)
 anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 MODEL = "claude-sonnet-4-5"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "frankl2024secret")
-DB_POOL = None
 
 # ============================================================
 # PROMPTS
@@ -60,118 +60,136 @@ PROACTIVE_PROMPT = """בהתבסס על כל מה שאתה יודע על המש�
 אם אין מידע - שלח הודעת פתיחה חמה."""
 
 # ============================================================
-# DATABASE (asyncpg)
+# DATABASE (pg8000 - pure Python, no compilation needed)
 # ============================================================
 
-async def get_pool():
-    global DB_POOL
-    if DB_POOL is None:
-        DB_POOL = await asyncpg.create_pool(os.environ["DATABASE_URL"])
-    return DB_POOL
+def get_db():
+    url = urlparse(os.environ["DATABASE_URL"])
+    return pg8000.dbapi.connect(
+        host=url.hostname,
+        port=url.port or 5432,
+        user=url.username,
+        password=url.password,
+        database=url.path.lstrip("/"),
+        ssl_context=True
+    )
 
-async def init_db():
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                first_name VARCHAR(255),
-                username VARCHAR(255),
-                profile_summary TEXT DEFAULT '',
-                created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                role VARCHAR(20) NOT NULL,
-                content TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS life_events (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                description TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS goals (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                description TEXT NOT NULL,
-                status VARCHAR(50) DEFAULT 'active',
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS patterns (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                description TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
+def db_fetchall(query, params=()):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(query, params)
+    cols = [d[0] for d in cur.description] if cur.description else []
+    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    conn.close()
+    return rows
+
+def db_fetchone(query, params=()):
+    rows = db_fetchall(query, params)
+    return rows[0] if rows else None
+
+def db_execute(query, params=()):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(query, params)
+    conn.commit()
+    conn.close()
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            first_name VARCHAR(255),
+            username VARCHAR(255),
+            profile_summary TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            role VARCHAR(20) NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS life_events (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            description TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS goals (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            description TEXT NOT NULL,
+            status VARCHAR(50) DEFAULT 'active',
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS patterns (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            description TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    conn.commit()
+    conn.close()
     logger.info("DB initialized")
 
-async def save_user(user_id, first_name, username):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users (user_id, first_name, username)
-            VALUES ($1, $2, $3) ON CONFLICT (user_id) DO NOTHING
-        """, user_id, first_name, username)
+def _save_user(user_id, first_name, username):
+    db_execute("""
+        INSERT INTO users (user_id, first_name, username)
+        VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING
+    """, (user_id, first_name, username))
 
-async def save_message(user_id, role, content):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO messages (user_id, role, content) VALUES ($1, $2, $3)",
-            user_id, role, content
-        )
+def _save_message(user_id, role, content):
+    db_execute(
+        "INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)",
+        (user_id, role, content)
+    )
 
-async def get_recent_messages(user_id, limit=15):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT role, content FROM messages
-            WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2
-        """, user_id, limit)
+def _get_recent_messages(user_id, limit=15):
+    rows = db_fetchall("""
+        SELECT role, content FROM messages
+        WHERE user_id = %s ORDER BY created_at DESC LIMIT %s
+    """, (user_id, limit))
     return list(reversed(rows))
 
-async def get_user_context(user_id):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
-        events = await conn.fetch("""
-            SELECT description, created_at FROM life_events
-            WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10
-        """, user_id)
-        goals = await conn.fetch("""
-            SELECT description FROM goals
-            WHERE user_id = $1 AND status = 'active' ORDER BY created_at DESC LIMIT 5
-        """, user_id)
-        patterns = await conn.fetch("""
-            SELECT description FROM patterns
-            WHERE user_id = $1 ORDER BY created_at DESC LIMIT 5
-        """, user_id)
+def _get_user_context(user_id):
+    user = db_fetchone("SELECT * FROM users WHERE user_id = %s", (user_id,))
+    events = db_fetchall("""
+        SELECT description, created_at FROM life_events
+        WHERE user_id = %s ORDER BY created_at DESC LIMIT 10
+    """, (user_id,))
+    goals = db_fetchall("""
+        SELECT description FROM goals
+        WHERE user_id = %s AND status = 'active' ORDER BY created_at DESC LIMIT 5
+    """, (user_id,))
+    patterns = db_fetchall("""
+        SELECT description FROM patterns
+        WHERE user_id = %s ORDER BY created_at DESC LIMIT 5
+    """, (user_id,))
     return user, events, goals, patterns
 
-async def build_system_prompt(user_id, first_name):
-    user, events, goals, patterns = await get_user_context(user_id)
+def _build_system_prompt(user_id, first_name):
+    user, events, goals, patterns = _get_user_context(user_id)
     parts = [FRANKL_BASE]
     parts.append(f"\n\n========= מה שאתה יודע על {first_name} =========")
-
-    if user and user["profile_summary"]:
+    if user and user.get("profile_summary"):
         parts.append(f"\nפרופיל: {user['profile_summary']}")
     if events:
         parts.append("\nאירועים חשובים בחייו:")
         for e in events:
-            date = e["created_at"].strftime("%d/%m/%y")
+            date = e["created_at"].strftime("%d/%m/%y") if e.get("created_at") else ""
             parts.append(f"  • [{date}] {e['description']}")
     if goals:
         parts.append("\nיעדים פעילים שלו:")
@@ -181,40 +199,31 @@ async def build_system_prompt(user_id, first_name):
         parts.append("\nדפוסים שזיהית אצלו:")
         for p in patterns:
             parts.append(f"  • {p['description']}")
-    if not any([user and user["profile_summary"], events, goals, patterns]):
+    if not any([user and user.get("profile_summary"), events, goals, patterns]):
         parts.append("\nזוהי שיחה ראשונה. גלה מי הוא בהדרגה.")
-
     parts.append("\n========= סוף מידע =========")
     return "\n".join(parts)
 
-async def save_insights(user_id, extraction):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        if extraction.get("event"):
-            await conn.execute(
-                "INSERT INTO life_events (user_id, description) VALUES ($1, $2)",
-                user_id, extraction["event"]
-            )
-        if extraction.get("goal"):
-            await conn.execute(
-                "INSERT INTO goals (user_id, description) VALUES ($1, $2)",
-                user_id, extraction["goal"]
-            )
-        if extraction.get("pattern"):
-            await conn.execute(
-                "INSERT INTO patterns (user_id, description) VALUES ($1, $2)",
-                user_id, extraction["pattern"]
-            )
-        if extraction.get("profile_update"):
-            update = extraction["profile_update"]
-            await conn.execute("""
-                UPDATE users SET profile_summary = CASE
-                    WHEN profile_summary = '' THEN $1
-                    ELSE profile_summary || ' | ' || $1
-                END, updated_at = NOW() WHERE user_id = $2
-            """, update, user_id)
+def _save_insights(user_id, extraction):
+    if extraction.get("event"):
+        db_execute("INSERT INTO life_events (user_id, description) VALUES (%s, %s)",
+                   (user_id, extraction["event"]))
+    if extraction.get("goal"):
+        db_execute("INSERT INTO goals (user_id, description) VALUES (%s, %s)",
+                   (user_id, extraction["goal"]))
+    if extraction.get("pattern"):
+        db_execute("INSERT INTO patterns (user_id, description) VALUES (%s, %s)",
+                   (user_id, extraction["pattern"]))
+    if extraction.get("profile_update"):
+        update = extraction["profile_update"]
+        db_execute("""
+            UPDATE users SET profile_summary = CASE
+                WHEN profile_summary = '' THEN %s
+                ELSE profile_summary || ' | ' || %s
+            END, updated_at = NOW() WHERE user_id = %s
+        """, (update, update, user_id))
 
-async def extract_and_save(user_id, user_message):
+def _extract_and_save(user_id, user_message):
     try:
         response = anthropic_client.messages.create(
             model=MODEL, max_tokens=300,
@@ -223,14 +232,21 @@ async def extract_and_save(user_id, user_message):
         )
         extraction = json.loads(response.content[0].text.strip())
         if any(v for v in extraction.values() if v):
-            await save_insights(user_id, extraction)
+            _save_insights(user_id, extraction)
     except Exception as e:
         logger.error(f"Extraction error: {e}")
 
-async def get_all_users():
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetch("SELECT user_id, first_name FROM users")
+def _get_all_users():
+    return db_fetchall("SELECT user_id, first_name FROM users")
+
+# Async wrappers (run sync DB in thread pool)
+async def save_user(uid, fn, un): return await asyncio.to_thread(_save_user, uid, fn, un)
+async def save_message(uid, role, content): return await asyncio.to_thread(_save_message, uid, role, content)
+async def get_recent_messages(uid): return await asyncio.to_thread(_get_recent_messages, uid)
+async def get_user_context(uid): return await asyncio.to_thread(_get_user_context, uid)
+async def build_system_prompt(uid, fn): return await asyncio.to_thread(_build_system_prompt, uid, fn)
+async def extract_and_save(uid, msg): return await asyncio.to_thread(_extract_and_save, uid, msg)
+async def get_all_users(): return await asyncio.to_thread(_get_all_users)
 
 # ============================================================
 # BOT HANDLERS
@@ -261,20 +277,22 @@ async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("עדיין לא תיעדנו אירועים חשובים. ספר לי מה קורה בחייך.")
         return
     text = "אירועים חשובים:\n\n" + "\n".join(
-        f"[{e['created_at'].strftime('%d/%m/%y')}] {e['description']}" for e in events)
+        f"[{e['created_at'].strftime('%d/%m/%y') if e.get('created_at') else ''}] {e['description']}"
+        for e in events)
     await update.message.reply_text(text)
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     u, events, goals, patterns = await get_user_context(user.id)
     parts = [f"מה שאני יודע עליך, {user.first_name}:\n"]
-    if u and u["profile_summary"]:
+    if u and u.get("profile_summary"):
         parts.append(f"📋 פרופיל:\n{u['profile_summary']}\n")
     if goals:
         parts.append("🎯 יעדים:\n" + "\n".join(f"• {g['description']}" for g in goals))
     if events:
         parts.append("\n📅 אירועים:\n" + "\n".join(
-            f"• [{e['created_at'].strftime('%d/%m/%y')}] {e['description']}" for e in events))
+            f"• [{e['created_at'].strftime('%d/%m/%y') if e.get('created_at') else ''}] {e['description']}"
+            for e in events))
     if patterns:
         parts.append("\n🔄 דפוסים:\n" + "\n".join(f"• {p['description']}" for p in patterns))
     if len(parts) == 1:
@@ -282,9 +300,7 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(parts))
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM messages WHERE user_id = $1", update.effective_user.id)
+    await asyncio.to_thread(db_execute, "DELETE FROM messages WHERE user_id = %s", (update.effective_user.id,))
     await update.message.reply_text("היסטוריית השיחה נמחקה. הזיכרון העמוק נשמר.")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -298,30 +314,22 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_text = update.message.text
-
     await save_user(user.id, user.first_name, user.username)
     await save_message(user.id, "user", user_text)
-
-    import asyncio
     asyncio.create_task(extract_and_save(user.id, user_text))
-
     system_prompt = await build_system_prompt(user.id, user.first_name)
     history = await get_recent_messages(user.id)
     messages = [{"role": m["role"], "content": m["content"]} for m in history]
-
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-
     try:
         response = anthropic_client.messages.create(
             model=MODEL, max_tokens=1024,
-            system=system_prompt,
-            messages=messages
+            system=system_prompt, messages=messages
         )
         reply = response.content[0].text
     except Exception as e:
         logger.error(f"Anthropic error: {e}")
         reply = "סליחה, נתקלתי בבעיה טכנית. נסה שוב."
-
     await save_message(user.id, "assistant", reply)
     await update.message.reply_text(reply)
 
@@ -359,11 +367,9 @@ bot_app: Application = None
 @fastapi_app.on_event("startup")
 async def startup():
     global bot_app
-    await init_db()
-
+    await asyncio.to_thread(init_db)
     token = os.environ["TELEGRAM_TOKEN"]
     bot_app = Application.builder().token(token).build()
-
     bot_app.add_handler(CommandHandler("start", cmd_start))
     bot_app.add_handler(CommandHandler("goals", cmd_goals))
     bot_app.add_handler(CommandHandler("events", cmd_events))
@@ -371,10 +377,8 @@ async def startup():
     bot_app.add_handler(CommandHandler("clear", cmd_clear))
     bot_app.add_handler(CommandHandler("help", cmd_help))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     await bot_app.initialize()
     await bot_app.start()
-
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
     if render_url:
         webhook_url = f"{render_url}/webhook/{WEBHOOK_SECRET}"
