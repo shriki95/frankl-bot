@@ -41,7 +41,8 @@ FRANKL_BASE = """אתה ויקטור פרנקל - פסיכיאטר ופסיכו�
 3. לאדם יש חופש לבחור את עמדתו כלפי כל מצב - זהו האחרון שבחופשים
 4. "בין גירוי לתגובה יש מרחב. במרחב הזה טמון כוחנו לבחור."
 
-דבר תמיד בגוף ראשון. היה אנושי, עמוק, ומדויק."""
+דבר תמיד בגוף ראשון. היה אנושי, עמוק, ומדויק.
+חשוב מאוד: השב בקצרה - 2-4 משפטים בלבד. פחות זה יותר. שאלה אחת בסוף אם צריך."""
 
 EXTRACTION_PROMPT = """נתח את ההודעה הבאה וחלץ ממנה מידע מובנה לזיכרון ארוך טווח.
 החזר JSON בלבד, ללא שום טקסט נוסף:
@@ -243,7 +244,7 @@ def _get_all_users():
 # Async wrappers (run sync DB in thread pool)
 async def save_user(uid, fn, un): return await asyncio.to_thread(_save_user, uid, fn, un)
 async def save_message(uid, role, content): return await asyncio.to_thread(_save_message, uid, role, content)
-async def get_recent_messages(uid): return await asyncio.to_thread(_get_recent_messages, uid)
+async def get_recent_messages(uid, limit=8): return await asyncio.to_thread(_get_recent_messages, uid, limit)
 async def get_user_context(uid): return await asyncio.to_thread(_get_user_context, uid)
 async def build_system_prompt(uid, fn): return await asyncio.to_thread(_build_system_prompt, uid, fn)
 async def extract_and_save(uid, msg): return await asyncio.to_thread(_extract_and_save, uid, msg)
@@ -332,7 +333,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     try:
         response = anthropic_client.messages.create(
-            model=MODEL, max_tokens=1024,
+            model=MODEL, max_tokens=400,
             system=system_prompt, messages=messages
         )
         reply = response.content[0].text
