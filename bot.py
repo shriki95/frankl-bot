@@ -332,15 +332,7 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     system_prompt = await build_system_prompt(user.id, user.first_name)
     history = await get_recent_messages(user.id)
     messages = [{"role": m["role"], "content": m["content"]} for m in history]
-    messages.append({"role": "user", "content": """סכם את התהליך שעברנו יחד עד עכשיו.
-כלול:
-- מה עלה בשיחות שלנו
-- מה השתנה או התפתח
-- דפוסים שזיהית
-- איפה אתה רואה אותי עכשיו
-- מה לדעתך צריך המשך עבודה
-
-דבר בגוף ראשון כפרנקל, בחום ובעומק. זה לא דוח - זה שיקוף אנושי."""})
+    messages.append({"role": "user", "content": """סכם את הדרך שעברנו יחד. דבר אליי ישירות, בחום, כמו שפרנקל היה מדבר - לא כדוח, לא כרשימה, לא כנתונים. משפטים רגילים, שפה אנושית. מה שמת לב אליו, מה מרגש אותך בתהליך שלי, ומה אתה רואה קדימה."""})
     await update.message.reply_text("רגע, אני מסכם את הדרך שעברנו...")
     try:
         response = anthropic_client.messages.create(
