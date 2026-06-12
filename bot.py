@@ -208,6 +208,12 @@ def _build_system_prompt(user_id, first_name):
     if not any([user and user.get("profile_summary"), events, goals, patterns]):
         parts.append("\nזוהי שיחה ראשונה. גלה מי הוא בהדרגה.")
     parts.append("\n========= סוף מידע =========")
+    parts.append("""
+כיצד להשתמש במידע הזה:
+- השתמש בו כרקע שקט - אל תצטט אותו ואל תזכיר אותו ישירות
+- אל תגיד "ראיתי שאתה..." או "לפי מה ששמרתי..."
+- פשוט דע את זה ותן לו להשפיע על השאלות והתגובות שלך בצורה טבעית
+- חבר נושאים רק כשהאדם מעלה אותם - לא ביוזמתך""")
     return "\n".join(parts)
 
 def _save_insights(user_id, extraction):
