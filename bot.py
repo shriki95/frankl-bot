@@ -357,7 +357,7 @@ async def send_morning_messages(bot):
             full_system = system_prompt + "\n\n" + PROACTIVE_PROMPT
             recent = await get_recent_messages(user_id)
             history = [{"role": m["role"], "content": m["content"]} for m in recent[-10:]]
-            history.append({"role": "user", "content": f"שלח הודעת בוקר. היום: {datetime.date.today().strftime('%d/%m/%Y')}. השתמש בשם העברי של המשתמש אם הוא ציין אותו בשיחה, אחרת אל תשתמש בשם כלל."})
+            history.append({"role": "user", "content": f"שלח הודעת בוקר. היום: {datetime.date.today().strftime('%d/%m/%Y')}."})
             response = anthropic_client.messages.create(
                 model=MODEL, max_tokens=400,
                 system=full_system,
