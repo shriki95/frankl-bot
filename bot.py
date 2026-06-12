@@ -53,9 +53,10 @@ EXTRACTION_PROMPT = """נתח את ההודעה הבאה וחלץ מידע לז�
   "event": "כל אירוע, מצב, רגש, או נושא שהוזכר - גם אם נראה קטן, null אם אין כלום",
   "goal": "כל שאיפה, רצון, או כוונה שהוזכרה, null אם אין",
   "pattern": "כל דפוס חוזר, תגובה רגשית, או התנהגות שנצפתה, null אם אין",
-  "profile_update": "כל עובדה על האדם - עבודה, משפחה, תחביבים, ערכים, פחדים, null אם אין"
+  "profile_update": "כל עובדה על האדם - עבודה, משפחה, תחביבים, ערכים, פחדים. טקסט פשוט בלבד, null אם אין"
 }
-העדף לשמור יותר מדי על פני לפספס מידע חשוב."""
+העדף לשמור יותר מדי על פני לפספס מידע חשוב.
+חשוב: כל ערך חייב להיות טקסט פשוט בעברית - לא JSON, לא רשימות, לא מבנים."""
 
 PROACTIVE_PROMPT = """בהתבסס על כל מה שאתה יודע על המשתמש, צור הודעה יזומה אחת לבוקר.
 - קצרה: 2-4 משפטים בלבד
@@ -296,9 +297,8 @@ async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     u, events, goals, patterns = await get_user_context(user.id)
-    parts = [f"מה שאני יודע עליך, {user.first_name}:\n"]
-    if u and u.get("profile_summary"):
-        parts.append(f"📋 פרופיל:\n{u['profile_summary']}\n")
+    parts = [f"מה שאני יודע עליך:\n"]
+
     if goals:
         parts.append("🎯 יעדים:\n" + "\n".join(f"• {g['description']}" for g in goals))
     if events:
