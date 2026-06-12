@@ -17,6 +17,7 @@ anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 MODEL = "claude-sonnet-4-5"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "frankl2024secret")
 ALLOWED_USER_ID = 1126985722
+processed_updates = set()
 
 # ============================================================
 # PROMPTS
@@ -408,6 +409,12 @@ async def webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
         return Response("unauthorized", status_code=403)
     data = await request.json()
+    update_id = data.get("update_id")
+    if update_id in processed_updates:
+        return Response("duplicate")
+    processed_updates.add(update_id)
+    if len(processed_updates) > 1000:
+        processed_updates.clear()
     update = Update.de_json(data, bot_app.bot)
     await bot_app.process_update(update)
     return Response("ok")
