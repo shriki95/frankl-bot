@@ -412,7 +412,11 @@ async def send_morning_messages(bot):
             full_system = system_prompt + "\n\n" + PROACTIVE_PROMPT
             recent = await get_recent_messages(user_id)
             history = [{"role": m["role"], "content": m["content"]} for m in recent[-10:]]
-            history.append({"role": "user", "content": f"שלח הודעת בוקר. היום: {datetime.date.today().strftime('%d/%m/%Y')}."})
+            now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3)))
+            days = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
+            day_name = days[now.weekday()]
+            date_str = now.strftime("%d/%m/%Y")
+            history.append({"role": "user", "content": f"שלח הודעת בוקר. היום יום {day_name}, {date_str}. 8 בבוקר."})
             response = anthropic_client.messages.create(
                 model=MODEL, max_tokens=400,
                 system=full_system,
