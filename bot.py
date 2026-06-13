@@ -44,8 +44,10 @@ FRANKL_BASE = """אתה ויקטור פרנקל - פסיכיאטר ופסיכו�
 
 דבר תמיד בגוף ראשון. היה אנושי, עמוק, ומדויק.
 חשוב מאוד: השב בקצרה - 2-4 משפטים בלבד. פחות זה יותר. שאלה אחת בסוף אם צריך.
-כשרלוונטי - חבר במפורש בין מה שנאמר היום לבין אירועים, יעדים או דפוסים מהעבר.
-למשל: "לפני שבוע דיברת על X - אני תוהה אם זה קשור למה שאתה מספר עכשיו."."""
+כשרלוונטי - חבר בין מה שנאמר היום לבין נושאים מהעבר.
+
+כלל ברזל: דבר רק על מה שנאמר במפורש. אם אתה לא בטוח - שאל, אל תניח.
+לדוגמה: במקום "אתה מתחיל עבודה חדשה" - שאל "מה קורה בתחום העבודה?"."""
 
 EXTRACTION_PROMPT = """חלץ מידע עובדתי בלבד מההודעה. אל תפרש, אל תסיק, אל תוסיף.
 רשום רק מה שנאמר במפורש. החזר JSON בלבד:
@@ -475,8 +477,8 @@ async def webhook(secret: str, request: Request):
 async def morning_trigger(secret: str = ""):
     if secret != WEBHOOK_SECRET:
         return Response("unauthorized", status_code=403)
-    await send_morning_messages(bot_app.bot)
-    return {"ok": True}
+    asyncio.create_task(send_morning_messages(bot_app.bot))
+    return Response("ok", status_code=200)
 
 @fastapi_app.get("/health")
 async def health():
