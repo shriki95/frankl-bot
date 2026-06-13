@@ -189,8 +189,14 @@ def _get_user_context(user_id):
     return user, events, goals, patterns
 
 def _build_system_prompt(user_id, first_name):
+    import datetime
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3)))
+    days = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
+    day_name = days[now.weekday()]
+    time_str = now.strftime("%H:%M")
+    date_str = now.strftime("%d/%m/%Y")
     user, events, goals, patterns = _get_user_context(user_id)
-    parts = [FRANKL_BASE]
+    parts = [FRANKL_BASE, f"\n\nכרגע: יום {day_name}, {date_str}, שעה {time_str} (שעון ישראל)."]
     parts.append(f"\n\n========= מה שאתה יודע על {first_name} =========")
     if user and user.get("profile_summary"):
         parts.append(f"\nפרופיל: {user['profile_summary']}")
@@ -412,11 +418,7 @@ async def send_morning_messages(bot):
             full_system = system_prompt + "\n\n" + PROACTIVE_PROMPT
             recent = await get_recent_messages(user_id)
             history = [{"role": m["role"], "content": m["content"]} for m in recent[-10:]]
-            now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3)))
-            days = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
-            day_name = days[now.weekday()]
-            date_str = now.strftime("%d/%m/%Y")
-            history.append({"role": "user", "content": f"שלח הודעת בוקר. היום יום {day_name}, {date_str}. 8 בבוקר."})
+            history.append({"role": "user", "content": "שלח הודעת בוקר."})
             response = anthropic_client.messages.create(
                 model=MODEL, max_tokens=400,
                 system=full_system,
