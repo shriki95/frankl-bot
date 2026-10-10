@@ -7,8 +7,11 @@ import anthropic
 logger = logging.getLogger(__name__)
 
 CHAT_MODEL = os.environ.get("MODEL", "claude-sonnet-5-5")
-MEMORY_MODEL = os.environ.get("MEMORY_MODEL", CHAT_MODEL)
 CHAT_EFFORT = os.environ.get("CHAT_EFFORT", "low")
+# Memory updates and parliament turn-taking are bookkeeping - a small model does them for a fraction of the cost.
+MEMORY_MODEL = os.environ.get("MEMORY_MODEL", "claude-haiku-5-5")
+MEMORY_EFFORT = os.environ.get("MEMORY_EFFORT", "medium")
+ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "claude-haiku-5-5")
 
 client = anthropic.AsyncAnthropic(timeout=120.0)
 

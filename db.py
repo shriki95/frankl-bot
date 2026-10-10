@@ -134,6 +134,53 @@ SCHEMA = [
         sent_at TIMESTAMPTZ
     )""",
     "CREATE INDEX IF NOT EXISTS reminders_status_due_idx ON reminders (status, due_at)",
+    # --- several advisors: every conversation, memory and reminder belongs to one persona ---
+    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS persona VARCHAR(20) NOT NULL DEFAULT 'frankl'",
+    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS speaker VARCHAR(20)",
+    "CREATE INDEX IF NOT EXISTS messages_user_persona_id_idx ON messages (user_id, persona, id)",
+    "ALTER TABLE memory_versions ADD COLUMN IF NOT EXISTS persona VARCHAR(20) NOT NULL DEFAULT 'frankl'",
+    "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS persona VARCHAR(20) NOT NULL DEFAULT 'frankl'",
+    """CREATE TABLE IF NOT EXISTS memories (
+        user_id BIGINT NOT NULL,
+        persona VARCHAR(20) NOT NULL,
+        memory TEXT NOT NULL DEFAULT '',
+        memory_cursor BIGINT NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ,
+        PRIMARY KEY (user_id, persona)
+    )""",
+    # Frankl's memory used to live in the users table.
+    """INSERT INTO memories (user_id, persona, memory, memory_cursor, updated_at)
+       SELECT user_id, 'frankl', memory, memory_cursor, memory_updated_at FROM users
+       WHERE memory <> '' OR memory_cursor > 0
+       ON CONFLICT DO NOTHING""",
+    """CREATE TABLE IF NOT EXISTS persona_settings (
+        user_id BIGINT NOT NULL,
+        persona VARCHAR(20) NOT NULL,
+        followups_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        checkin_asked BOOLEAN NOT NULL DEFAULT TRUE,
+        PRIMARY KEY (user_id, persona)
+    )""",
+    """INSERT INTO persona_settings (user_id, persona, followups_enabled, checkin_asked)
+       SELECT user_id, 'frankl', followups_enabled, checkin_asked FROM users
+       ON CONFLICT DO NOTHING""",
+    # Forum topics in the user's group: which topic belongs to which persona (or the parliament).
+    """CREATE TABLE IF NOT EXISTS spaces (
+        chat_id BIGINT NOT NULL,
+        thread_id BIGINT NOT NULL,
+        user_id BIGINT NOT NULL,
+        persona VARCHAR(20) NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (chat_id, thread_id)
+    )""",
+    # requested_by: 'user' (he asked for it) or 'advisor' (the persona's own initiative; was 'frankl').
+    "UPDATE reminders SET requested_by = 'advisor' WHERE requested_by = 'frankl'",
+    "ALTER TABLE reminders ALTER COLUMN requested_by SET DEFAULT 'advisor'",
+    """CREATE TABLE IF NOT EXISTS parliament (
+        user_id BIGINT PRIMARY KEY,
+        mode VARCHAR(20) NOT NULL DEFAULT 'views',
+        turn INT NOT NULL DEFAULT 0,
+        absent TEXT NOT NULL DEFAULT ''
+    )""",
 ]
 
 
