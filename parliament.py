@@ -33,11 +33,12 @@ KEYS = [p.key for p in personas.ALL]
 
 @dataclass
 class Plan:
-    action: str = "respond"          # respond / brief / summary / usage / stop / new_topic / none / more
+    action: str = "respond"          # respond / brief / summary / usage / poll / stop / new_topic / none / more
     mode_change: str = "none"
     speakers: list = field(default_factory=list)
     recall: list = field(default_factory=list)
     focus: str = ""
+    poll: dict | None = None         # action "poll": {"question", "options", "multiple"}
 
 
 # ============================================================
@@ -261,6 +262,57 @@ async def debate(user_id, first_name, state, emit, focus="", first=None, last_sp
     return True
 
 
+VOTE_RE = re.compile(r"<<\s*הצבעה\s*:\s*([\d,\s]+)>>")
+
+
+def _vote(text, n_options):
+    """His words without the vote mark, and the options he chose (numbers from 1)."""
+    match = VOTE_RE.search(text)
+    if not match:
+        return text.strip(), []
+    chosen = sorted({int(n) for n in re.findall(r"\d+", match.group(1)) if 1 <= int(n) <= n_options})
+    return VOTE_RE.sub("", text).strip(), chosen
+
+
+def tally(poll, votes):
+    """The chair's count: who chose what."""
+    lines = [prompts.POLL_TALLY]
+    for number, option in enumerate(poll["options"], 1):
+        voters = [personas.BY_KEY[k].short for k, chosen in votes.items() if number in chosen]
+        lines.append(prompts.POLL_TALLY_LINE.format(option=option, count=len(voters),
+                                                    names=", ".join(voters) or prompts.POLL_NOBODY))
+    undecided = [personas.BY_KEY[k].short for k, chosen in votes.items() if not chosen]
+    if undecided:
+        lines.append(prompts.POLL_UNDECIDED.format(names=", ".join(undecided)))
+    return "\n".join(lines)
+
+
+async def poll_round(user_id, first_name, state, poll, emit, show):
+    """Everyone votes at once, each with a reason in his own voice; then the chair counts."""
+    keys = present(state)
+    options = "\n".join(f"{i}. {option}" for i, option in enumerate(poll["options"], 1))
+    turn = prompts.TURN_POLL.format(question=poll["question"], options=options,
+                                    how=prompts.VOTE_MANY if poll["multiple"] else prompts.VOTE_ONE)
+    results = await asyncio.gather(*(_write(user_id, first_name, k, turn, "", show) for k in keys),
+                                   return_exceptions=True)
+    votes = {}
+    for key, result in zip(keys, results):
+        if isinstance(result, Exception):
+            logger.error(f"Vote by {key} failed: {result!r}")
+            continue
+        text, left = result
+        text, votes[key] = _vote(text, len(poll["options"]))
+        if text:
+            await emit(key, text)
+        if left:
+            state["absent"].append(key)
+            await db.call(save_state, user_id, state)
+            await emit("chair", prompts.MEMBER_LEFT.format(name=personas.BY_KEY[key].name))
+    if votes:
+        await emit("chair", tally(poll, votes))
+    return "round"
+
+
 async def respond(user_id, first_name, plan, emit, show=_no_show):
     """Carry out a plan. emit(speaker, text) sends and saves one message; show(speaker, True/False)
     marks who is writing right now.
@@ -310,6 +362,8 @@ async def respond(user_id, first_name, plan, emit, show=_no_show):
             state["absent"].remove(key)
             await db.call(save_state, user_id, state)
             await emit("chair", prompts.MEMBER_RETURNED.format(name=personas.BY_KEY[key].name))
+    if plan.action == "poll":  # a poll asks for everyone's vote - whatever the mode
+        return await poll_round(user_id, first_name, state, plan.poll, emit, show) if present(state) else "none"
     if plan.action == "none" or (state["mode"] == "silent" and not speakers):
         return "ack" if changed else "silent"
     if not present(state):
