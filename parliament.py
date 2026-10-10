@@ -198,8 +198,25 @@ async def chair_summary(user_id, first_name):
 # A ROUND
 # ============================================================
 
-async def _speak(user_id, first_name, state, key, turn, focus, emit):
-    text, left = await statement(user_id, first_name, key, turn, focus)
+def _no_show(key, writing):
+    pass
+
+
+async def _write(user_id, first_name, key, turn, focus, show):
+    """A statement, with 'typing...' shown for him while he writes it (emit clears it when it is sent)."""
+    show(key, True)
+    try:
+        text, left = await statement(user_id, first_name, key, turn, focus)
+    except BaseException:
+        show(key, False)
+        raise
+    if not text:
+        show(key, False)
+    return text, left
+
+
+async def _speak(user_id, first_name, state, key, turn, focus, emit, show):
+    text, left = await _write(user_id, first_name, key, turn, focus, show)
     if text:
         await emit(key, text)
     if left:
@@ -219,13 +236,13 @@ def _next_in_rotation(state, after=None, exclude=()):
     return keys[state["turn"] % len(keys)]
 
 
-async def debate(user_id, first_name, state, emit, focus="", first=None, last_speaker=None):
+async def debate(user_id, first_name, state, emit, focus="", first=None, last_speaker=None, show=_no_show):
     """A burst of discussion between the personas. Returns True if it stopped only because of the budget."""
     speaker = first if first in present(state) else _next_in_rotation(state, after=last_speaker)
     for _ in range(DEBATE_BURST):
         if speaker is None:
             return False
-        text, left = await statement(user_id, first_name, speaker, prompts.TURN_DEBATE, focus)
+        text, left = await _write(user_id, first_name, speaker, prompts.TURN_DEBATE, focus, show)
         focus = ""  # the focus frames the first statement; after that they follow each other
         if text:
             await emit(speaker, text)
@@ -241,8 +258,9 @@ async def debate(user_id, first_name, state, emit, focus="", first=None, last_sp
     return True
 
 
-async def respond(user_id, first_name, plan, emit):
-    """Carry out a plan. emit(speaker, text) sends and saves one message.
+async def respond(user_id, first_name, plan, emit, show=_no_show):
+    """Carry out a plan. emit(speaker, text) sends and saves one message; show(speaker, True/False)
+    marks who is writing right now.
     Returns 'round' (show the meeting buttons), 'paused' (debate burst used up), 'silent', 'ack' or 'none'."""
     state = await db.call(get_state, user_id)
     changed = False
@@ -265,7 +283,11 @@ async def respond(user_id, first_name, plan, emit):
         await emit("chair", prompts.NEW_TOPIC)
         return "none"
     if plan.action == "summary":
-        text = await chair_summary(user_id, first_name)
+        show("chair", True)
+        try:
+            text = await chair_summary(user_id, first_name)
+        finally:
+            show("chair", False)
         if text:
             await emit("chair", text)
         return "round"
@@ -273,7 +295,8 @@ async def respond(user_id, first_name, plan, emit):
         return "ack"
     if plan.action == "more":
         _, window, _ = await db.call(load, user_id)
-        return "paused" if await debate(user_id, first_name, state, emit, last_speaker=_last_speaker(window)) else "round"
+        return "paused" if await debate(user_id, first_name, state, emit, last_speaker=_last_speaker(window),
+                                        show=show) else "round"
 
     speakers = [k for k in plan.speakers if k in KEYS]
     for key in speakers:  # addressing someone who left brings him back
@@ -289,26 +312,26 @@ async def respond(user_id, first_name, plan, emit):
     mode = state["mode"]
     if mode == "debate":
         return "paused" if await debate(user_id, first_name, state, emit, plan.focus,
-                                        first=speakers[0] if speakers else None) else "round"
+                                        first=speakers[0] if speakers else None, show=show) else "round"
     if speakers:
         for key in speakers:
-            await _speak(user_id, first_name, state, key, prompts.TURN_DIRECT, plan.focus, emit)
+            await _speak(user_id, first_name, state, key, prompts.TURN_DIRECT, plan.focus, emit, show)
         return "round"
     if mode == "rotation":
         key = _next_in_rotation(state)
         state["turn"] += 1
         await db.call(save_state, user_id, state)
-        await _speak(user_id, first_name, state, key, prompts.TURN_ROTATION, plan.focus, emit)
+        await _speak(user_id, first_name, state, key, prompts.TURN_ROTATION, plan.focus, emit, show)
         return "round"
     if mode == "one_by_one":
         for key in present(state):
             if key in present(state):  # someone may have walked out mid-round
-                await _speak(user_id, first_name, state, key, prompts.TURN_ONE_BY_ONE, plan.focus, emit)
+                await _speak(user_id, first_name, state, key, prompts.TURN_ONE_BY_ONE, plan.focus, emit, show)
         return "round"
     # views: independent answers, written in parallel and sent in order
     keys = present(state)
-    results = await asyncio.gather(*(statement(user_id, first_name, k, prompts.TURN_VIEWS, plan.focus) for k in keys),
-                                   return_exceptions=True)
+    results = await asyncio.gather(*(_write(user_id, first_name, k, prompts.TURN_VIEWS, plan.focus, show)
+                                     for k in keys), return_exceptions=True)
     for key, result in zip(keys, results):
         if isinstance(result, Exception):
             logger.error(f"Parliament statement by {key} failed: {result!r}")

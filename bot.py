@@ -15,7 +15,9 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.error import BadRequest, Forbidden
+from telegram.ext import (Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes,
+                          MessageHandler, filters)
 
 import brain
 import clock
@@ -26,6 +28,7 @@ import personas
 import prompts
 import reminders
 import spaces
+import voices
 from spaces import Space
 
 logging.basicConfig(level=logging.INFO)
@@ -87,26 +90,69 @@ def split_text(text, limit=TELEGRAM_LIMIT):
     return [chunk for chunk in chunks if chunk]
 
 
-async def send_text(bot, space, text, parse_mode=None, reply_markup=None):
+async def send_text(bot, space, text, parse_mode=None, reply_markup=None, **options):
     """Send to a conversation (private chat or topic). Returns the last message sent."""
     chunks = split_text(text)
     sent = None
     for i, chunk in enumerate(chunks):
         sent = await bot.send_message(chat_id=space.chat_id, text=chunk, parse_mode=parse_mode,
                                       message_thread_id=space.thread_id,
-                                      reply_markup=reply_markup if i == len(chunks) - 1 else None)
+                                      reply_markup=reply_markup if i == len(chunks) - 1 else None, **options)
     return sent
 
 
+def speaker_of(space):
+    """Who speaks in a conversation: its persona, or the chair in the parliament."""
+    return voices.CHAIR if space.persona == PARLIAMENT else space.persona
+
+
+async def post(space, speaker, text, parse_mode=None, reply_markup=None, sign=True, **options):
+    """Send as a persona (or the chair), through his own bot. In the group, when his bot can't post there
+    (not connected yet, or not added to the group), the main bot posts for him - signed with his name."""
+    bot = voices.bot_for(speaker)
+    if bot is not bot_app.bot:
+        try:
+            return await send_text(bot, space, text, parse_mode, reply_markup, **options)
+        except Forbidden:
+            if space.private:
+                raise  # a private chat belongs to one bot
+            logger.warning(f"{speaker}'s bot can't post in the group - the main bot posts for him")
+    if sign and speaker != voices.MAIN:
+        body = text if parse_mode == ParseMode.HTML else html.escape(text, quote=False)
+        text, parse_mode = f"<b>{html.escape(speaker_title(speaker), quote=False)}</b>\n{body}", ParseMode.HTML
+    return await send_text(bot_app.bot, space, text, parse_mode, reply_markup, **options)
+
+
+async def answer(space, text, parse_mode=None):
+    """A reply in a conversation, from whoever speaks there."""
+    return await post(space, speaker_of(space), text, parse_mode)
+
+
 @contextlib.asynccontextmanager
-async def typing(bot, space):
-    """Show 'typing...' until the block ends (Telegram clears it after ~5 seconds)."""
+async def typing(space, writing):
+    """Show 'typing...' until the block ends, for each speaker writing() names, through his own bot.
+    (Telegram clears it after ~5 seconds, or when he sends.)"""
+    async def show(key):
+        action = dict(chat_id=space.chat_id, action=ChatAction.TYPING, message_thread_id=space.thread_id)
+        try:
+            await voices.bot_for(key).send_chat_action(**action)
+        except Forbidden:
+            if not space.private:  # his bot isn't in the group - the main bot posts for him
+                with contextlib.suppress(Exception):
+                    await bot_app.bot.send_chat_action(**action)
+        except Exception:
+            pass
+
     async def keep_typing():
+        shown = {}
         while True:
-            with contextlib.suppress(Exception):
-                await bot.send_chat_action(chat_id=space.chat_id, action=ChatAction.TYPING,
-                                           message_thread_id=space.thread_id)
-            await asyncio.sleep(4.5)
+            now = set(writing())
+            shown = {key: at for key, at in shown.items() if key in now}
+            for key in now:
+                if time.monotonic() - shown.get(key, float("-inf")) > 4.5:
+                    shown[key] = time.monotonic()
+                    await show(key)
+            await asyncio.sleep(0.1)
     task = asyncio.create_task(keep_typing())
     try:
         yield
@@ -114,9 +160,10 @@ async def typing(bot, space):
         task.cancel()
 
 
-async def react(bot, message, emoji):
+async def react(message, emoji):
     with contextlib.suppress(Exception):
-        await bot.set_message_reaction(chat_id=message.chat_id, message_id=message.message_id, reaction=emoji)
+        await bot_app.bot.set_message_reaction(chat_id=message.chat_id, message_id=message.message_id,
+                                               reaction=emoji)
 
 
 def memory_html(text):
@@ -161,7 +208,11 @@ async def resolve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """The conversation a message belongs to, or None (after pointing him to the right place)."""
     chat = update.effective_chat
     if chat.type == "private":
-        return Space(chat.id, None, "frankl")
+        key = voices.key_of(update.get_bot())   # the main bot's private chat is Frankl's
+        if key == voices.CHAIR:
+            await update.effective_message.reply_text(prompts.CHAIR_PRIVATE)
+            return None
+        return Space(chat.id, None, key) if key else None
     message = update.effective_message
     thread_id = message.message_thread_id if message.is_topic_message else None
     if thread_id is not None:
@@ -170,54 +221,202 @@ async def resolve(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return Space(chat.id, thread_id, persona)
     # The group's general topic, a topic we didn't open, or a group without topics.
     if not await db.call(spaces.in_chat, chat.id):
-        await setup(context.bot, chat, update.effective_user.id)
+        await setup(chat, update.effective_user.id)
     else:
-        await send_guide(context.bot, chat.id, thread_id)
+        await post(Space(chat.id, thread_id, PARLIAMENT), voices.CHAIR, await guide_text(chat.id), sign=False,
+                   disable_web_page_preview=True)
     return None
 
 
-async def send_guide(bot, chat_id, thread_id=None):
+async def guide_text(chat_id):
     threads = await db.call(spaces.in_chat, chat_id)
-    lines = [f"{personas.BY_KEY[p.key].title} - {p.domain}: {spaces.link(chat_id, threads[p.key])}"
+    lines = [f"{p.title} - {p.domain}: {spaces.link(chat_id, threads[p.key])}"
              for p in personas.ALL if p.key in threads]
     if PARLIAMENT in threads:
         lines.append(f"{prompts.CHAIR_EMOJI} ישיבת פרלמנט: {spaces.link(chat_id, threads[PARLIAMENT])}")
-    text = prompts.GROUP_GUIDE.format(emoji=prompts.CHAIR_EMOJI, links="\n".join(lines))
-    return await bot.send_message(chat_id=chat_id, text=text, message_thread_id=thread_id,
-                                  disable_web_page_preview=True)
+    return prompts.GROUP_GUIDE.format(emoji=prompts.CHAIR_EMOJI, links="\n".join(lines))
 
 
-async def setup(bot, chat, user_id):
-    """Open a topic for every persona and one for the parliament, in a group with topics enabled."""
-    if chat.type == "private":
-        await bot.send_message(chat_id=chat.id, text=prompts.SETUP_NOT_FORUM)
-        return
-    if not chat.is_forum:
-        await bot.send_message(chat_id=chat.id, text=prompts.SETUP_NOT_FORUM)
-        return
-    me = await bot.get_chat_member(chat.id, bot.id)
-    if not getattr(me, "can_manage_topics", False):
-        await bot.send_message(chat_id=chat.id, text=prompts.SETUP_NO_RIGHTS)
-        return
-    existing = await db.call(spaces.in_chat, chat.id)
-    roster = "\n".join(f"{p.title} - {p.domain}" for p in personas.ALL)
-    for key in [p.key for p in personas.ALL] + [PARLIAMENT]:
-        if key in existing:
-            continue
-        persona = personas.BY_KEY.get(key)
-        topic = await bot.create_forum_topic(chat.id, persona.title if persona else
-                                             f"{prompts.CHAIR_EMOJI} ישיבת פרלמנט")
-        await db.call(spaces.save, chat.id, topic.message_thread_id, user_id, key)
-        if persona:
-            known = await db.call(memory.latest_user_message_id, user_id, key)
-            intro = f"{persona.short} כאן. ממשיכים מאיפה שעצרנו." if known else persona.opening
-        else:
-            intro = prompts.PARLIAMENT_INTRO.format(emoji=prompts.CHAIR_EMOJI, roster=roster)
-        await bot.send_message(chat_id=chat.id, text=intro, message_thread_id=topic.message_thread_id)
-    guide = await send_guide(bot, chat.id)
+async def refresh_guide(chat_id):
+    """Keep one pinned guide in the group's general topic, linking to the current topics."""
+    text = await guide_text(chat_id)
+    old = await db.call(spaces.guide, chat_id)
+    by = voices.CHAIR if voices.has_own(voices.CHAIR) else voices.MAIN
+    if old and old["guide_by"] == by:
+        try:
+            await voices.bot_for(by).edit_message_text(text, chat_id=chat_id, message_id=old["guide_message_id"],
+                                                       disable_web_page_preview=True)
+            return
+        except BadRequest as error:
+            if "not modified" in str(error):
+                return
+            logger.warning(f"Editing the guide failed, sending a new one: {error}")
+        except Exception as error:
+            logger.warning(f"Editing the guide failed, sending a new one: {error!r}")
+    guide = await post(Space(chat_id, None, PARLIAMENT), voices.CHAIR, text, sign=False, disable_web_page_preview=True)
+    main = bot_app.bot
     with contextlib.suppress(Exception):
-        await bot.pin_chat_message(chat_id=chat.id, message_id=guide.message_id, disable_notification=True)
-    await bot.send_message(chat_id=chat.id, text=prompts.SETUP_DONE)
+        if old:
+            await main.delete_message(chat_id, old["guide_message_id"])
+        else:  # a guide from before they were kept track of
+            await main.unpin_all_general_forum_topic_messages(chat_id)
+    with contextlib.suppress(Exception):
+        await main.pin_chat_message(chat_id=chat_id, message_id=guide.message_id, disable_notification=True)
+    await db.call(spaces.save_guide, chat_id, guide.message_id, voices.key_of(guide.get_bot()))
+
+
+async def intro_text(user_id, key):
+    """How a persona (or the chair, for the parliament) opens a conversation."""
+    persona = personas.BY_KEY.get(key)
+    if persona is None:
+        roster = "\n".join(f"{p.title} - {p.domain}" for p in personas.ALL)
+        return prompts.PARLIAMENT_INTRO.format(emoji=prompts.CHAIR_EMOJI, roster=roster)
+    known = await db.call(memory.latest_user_message_id, user_id, key)
+    return f"{persona.short} כאן. ממשיכים מאיפה שעצרנו." if known else persona.opening
+
+
+_layout_lock = asyncio.Lock()   # setup and reopening topics change the same topics and guide
+
+
+async def open_topic(chat_id, user_id, key):
+    """A topic for a persona (or the parliament), opened with a word from him (or from the chair)."""
+    persona = personas.BY_KEY.get(key)
+    topic = await bot_app.bot.create_forum_topic(chat_id, persona.title if persona else
+                                                 f"{prompts.CHAIR_EMOJI} ישיבת פרלמנט")
+    space = Space(chat_id, topic.message_thread_id, key)
+    await db.call(spaces.save, chat_id, space.thread_id, user_id, key)
+    speaker = speaker_of(space)
+    intro = await post(space, speaker, await intro_text(user_id, key))
+    if voices.key_of(intro.get_bot()) == speaker:
+        await db.call(spaces.set_voiced, chat_id, space.thread_id)
+
+
+async def setup(chat, user_id):
+    """Open a topic for every persona and one for the parliament, in a group with topics enabled."""
+    main = bot_app.bot
+    if not chat.is_forum:
+        await main.send_message(chat_id=chat.id, text=prompts.SETUP_NOT_FORUM)
+        return
+    me = await main.get_chat_member(chat.id, main.id)
+    if not getattr(me, "can_manage_topics", False):
+        await main.send_message(chat_id=chat.id, text=prompts.SETUP_NO_RIGHTS)
+        return
+    async with _layout_lock:
+        existing = await db.call(spaces.in_chat, chat.id)
+        for key in [p.key for p in personas.ALL] + [PARLIAMENT]:
+            if key not in existing:
+                await open_topic(chat.id, user_id, key)
+        await refresh_guide(chat.id)
+    await post(Space(chat.id, None, PARLIAMENT), voices.CHAIR, prompts.SETUP_DONE, sign=False)
+
+# ============================================================
+# A BOT OF HIS OWN FOR EVERY PERSONA
+# ============================================================
+
+
+def voice_url(key):
+    return f"{public_url}/webhook/{key}"
+
+
+async def in_group(bot, chat_id):
+    try:
+        member = await bot_app.bot.get_chat_member(chat_id, bot.id)
+    except Exception:
+        return False
+    return member.status in ("member", "administrator", "restricted")
+
+
+async def voice_joined(key, chat_id, user_id):
+    """A persona's own bot is in the group: his topic is opened again, this time by him."""
+    target = PARLIAMENT if key == voices.CHAIR else key
+    async with _layout_lock:
+        thread_id = (await db.call(spaces.in_chat, chat_id)).get(target)
+        if thread_id is None or await db.call(spaces.is_voiced, chat_id, thread_id):
+            return
+        reopened = False
+        # Only a topic with nothing from him in it yet - a conversation is never deleted.
+        if await db.call(memory.latest_user_message_id, user_id, target) is None:
+            try:
+                await bot_app.bot.delete_forum_topic(chat_id, thread_id)
+                reopened = True
+            except Exception as error:
+                logger.warning(f"Couldn't reopen the topic of {target}: {error!r}")
+        if reopened:
+            await db.call(spaces.remove, chat_id, thread_id)
+            await open_topic(chat_id, user_id, target)
+        else:
+            await db.call(spaces.set_voiced, chat_id, thread_id)
+        if reopened or key == voices.CHAIR:  # new links, or the chair takes over the guide
+            await refresh_guide(chat_id)
+
+
+async def add_voice(update):
+    """He forwarded BotFather's message: the new bot becomes the voice of a persona (or of the chair)."""
+    message = update.effective_message
+    token = voices.TOKEN_RE.search(message.text).group(0)
+    with contextlib.suppress(Exception):
+        await message.delete()   # the token shouldn't stay in the chat
+    bot = await voices.connect(token)
+    if bot is None:
+        await message.chat.send_message(prompts.VOICE_BAD_TOKEN)
+        return
+    if bot.id == bot_app.bot.id:
+        await bot.shutdown()
+        await message.chat.send_message(prompts.VOICE_IS_MAIN)
+        return
+    key = voices.guess(bot)
+    if key is None:
+        voices.pending[bot.id] = (bot, token)
+        buttons = [[InlineKeyboardButton(voices.title(k), callback_data=f"voice:{bot.id}:{k}")] for k in voices.KEYS]
+        await message.chat.send_message(prompts.VOICE_WHO.format(username=bot.username),
+                                        reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    await connect_voice(message.chat, update.effective_user.id, key, bot, token)
+
+
+async def connect_voice(chat, user_id, key, bot, token):
+    try:
+        await voices.assign(key, bot, token, voice_url(key), TELEGRAM_SECRET_TOKEN)
+    except Exception as error:
+        logger.error(f"Connecting {key}'s bot failed: {voices.describe_error(error, bot)}")
+        await chat.send_message(prompts.ERROR_TEXT)
+        return
+    lines = [prompts.VOICE_CONNECTED.format(title=voices.title(key), username=bot.username)]
+    group = await db.call(spaces.group_of, user_id)
+    if group is not None and await in_group(bot, group):
+        await voice_joined(key, group, user_id)
+        lines.append(prompts.VOICE_IN_GROUP)
+    else:
+        lines.append(prompts.VOICE_ADD_TO_GROUP.format(username=bot.username))
+    missing = voices.missing()
+    lines.append(prompts.VOICE_REMAINING.format(names=", ".join(voices.name(k) for k in missing)) if missing
+                 else prompts.VOICE_ALL_DONE)
+    await chat.send_message("\n".join(lines))
+
+
+async def on_voice_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ALLOWED_USER_ID or query.message is None:
+        return
+    _, bot_id, key = query.data.split(":")
+    found = voices.pending.pop(int(bot_id), None)
+    with contextlib.suppress(Exception):
+        await query.edit_message_reply_markup(reply_markup=None)
+    if found is None or key not in voices.KEYS:
+        await query.message.chat.send_message(prompts.VOICE_EXPIRED)
+        return
+    await connect_voice(query.message.chat, query.from_user.id, key, *found)
+
+
+async def on_my_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A persona's bot was added to a group."""
+    change = update.my_chat_member
+    key = voices.key_of(update.get_bot())
+    if key in (None, voices.MAIN) or change.from_user.id != ALLOWED_USER_ID or change.chat.type == "private":
+        return
+    if change.new_chat_member.status in ("member", "administrator") and await db.call(spaces.in_chat, change.chat.id):
+        await voice_joined(key, change.chat.id, change.from_user.id)
 
 # ============================================================
 # COMMANDS
@@ -234,16 +433,18 @@ async def command_space(update, context):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update): return
     await register(update.effective_user)
-    if update.effective_chat.type == "private":
-        await update.effective_message.reply_text(personas.BY_KEY["frankl"].opening)
-    else:
-        await resolve(update, context)
+    space = await resolve(update, context)
+    if space:
+        await answer(space, await intro_text(update.effective_user.id, space.persona))
 
 
 async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update): return
     await register(update.effective_user)
-    await setup(context.bot, update.effective_chat, update.effective_user.id)
+    if update.effective_chat.type == "private":
+        await update.effective_message.reply_text(prompts.SETUP_NOT_FORUM)
+        return
+    await setup(update.effective_chat, update.effective_user.id)
 
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -251,10 +452,10 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not space: return
     text = await db.call(memory.get_memory, update.effective_user.id, space.persona)
     if not text:
-        await send_text(context.bot, space, "עדיין בתחילת הדרך. ככל שנדבר יותר - אדע אותך יותר.")
+        await answer(space, "עדיין בתחילת הדרך. ככל שנדבר יותר - אדע אותך יותר.")
         return
     title = "מה שנאמר בישיבות עד עכשיו:" if space.persona == PARLIAMENT else "מה שאני יודע עליך:"
-    await send_text(context.bot, space, f"<b>{title}</b>\n" + memory_html(text), ParseMode.HTML)
+    await answer(space, f"<b>{title}</b>\n" + memory_html(text), ParseMode.HTML)
 
 
 async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -263,9 +464,9 @@ async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = "מסקנות והחלטות" if space.persona == PARLIAMENT else "יעדים ושאיפות"
     body = memory.section(await db.call(memory.get_memory, update.effective_user.id, space.persona), title)
     if not has_content(body):
-        await send_text(context.bot, space, "עדיין לא תיעדנו כאן יעדים. ספר לי - מה אתה שואף אליו?")
+        await answer(space, "עדיין לא תיעדנו כאן יעדים. ספר לי - מה אתה שואף אליו?")
         return
-    await send_text(context.bot, space, f"<b>{title}:</b>\n\n" + html.escape(body, quote=False), ParseMode.HTML)
+    await answer(space, f"<b>{title}:</b>\n\n" + html.escape(body, quote=False), ParseMode.HTML)
 
 
 async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -276,9 +477,9 @@ async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = [(title, memory.section(text, title)) for title in titles]
     parts = [(title, body) for title, body in parts if has_content(body)]
     if not parts:
-        await send_text(context.bot, space, "עדיין לא תיעדנו כאן אירועים. ספר לי מה קורה.")
+        await answer(space, "עדיין לא תיעדנו כאן אירועים. ספר לי מה קורה.")
         return
-    await send_text(context.bot, space, "\n\n".join(
+    await answer(space, "\n\n".join(
         f"<b>{title}:</b>\n{html.escape(body, quote=False)}" for title, body in parts), ParseMode.HTML)
 
 
@@ -286,7 +487,7 @@ async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     space = await command_space(update, context)
     if not space: return
     if space.persona == PARLIAMENT:
-        await send_text(context.bot, space, "בפרלמנט אין פניות יזומות - כל אחד כותב לך ביוזמתו בשיחה האישית שלו.")
+        await answer(space, "בפרלמנט אין פניות יזומות - כל אחד כותב לך ביוזמתו בשיחה האישית שלו.")
         return
     settings = await db.call(reminders.get_settings, update.effective_user.id, space.persona)
     lines = ["<b>מתי אני כותב לך ביוזמתי:</b>",
@@ -297,7 +498,7 @@ async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• {clock.short(r['due_at'])} - {html.escape(r['purpose'], quote=False)}"
             for r in settings["scheduled"]]
     lines += ["", 'רוצה לשנות? פשוט תגיד לי - למשל "תכתוב לי כל ערב ב-21:00" או "אל תכתוב לי ביוזמתך".']
-    await send_text(context.bot, space, "\n".join(lines), ParseMode.HTML)
+    await answer(space, "\n".join(lines), ParseMode.HTML)
 
 
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -305,16 +506,16 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not space: return
     user = update.effective_user
     if space.persona == PARLIAMENT:
-        await run_parliament(context.bot, space, user, parliament.Plan(action="summary"), update.effective_message)
+        await run_parliament(space, user, parliament.Plan(action="summary"), update.effective_message)
         return
-    await send_text(context.bot, space, "רגע, אני מסכם את הדרך שעברנו...")
-    async with typing(context.bot, space), brain.conversation_lock(user.id, space.persona):
+    await answer(space, "רגע, אני מסכם את הדרך שעברנו...")
+    async with typing(space, lambda: [space.persona]), brain.conversation_lock(user.id, space.persona):
         try:
             text = await brain.summarize(user.id, user.first_name, space.persona)
         except Exception:
             logger.exception("Summary error")
             text = "סליחה, לא הצלחתי לייצר סיכום כרגע."
-    await send_text(context.bot, space, text)
+    await answer(space, text)
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -322,11 +523,11 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not space: return
     user = update.effective_user
     if space.persona == PARLIAMENT:
-        await run_parliament(context.bot, space, user, parliament.Plan(action="new_topic"), update.effective_message)
+        await run_parliament(space, user, parliament.Plan(action="new_topic"), update.effective_message)
         return
-    async with typing(context.bot, space), brain.conversation_lock(user.id, space.persona):
+    async with typing(space, lambda: [space.persona]), brain.conversation_lock(user.id, space.persona):
         cleared = await memory.clear_history(user.id, space.persona)
-    await send_text(context.bot, space, "היסטוריית השיחה נמחקה. הזיכרון העמוק נשמר." if cleared else
+    await answer(space, "היסטוריית השיחה נמחקה. הזיכרון העמוק נשמר." if cleared else
                     "לא הצלחתי לשמור את הזיכרון כרגע, אז לא מחקתי כלום. נסה שוב עוד מעט.")
 
 
@@ -350,6 +551,9 @@ async def save_incoming(user, persona, text, kind="chat"):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update): return
+    if voices.TOKEN_RE.search(update.effective_message.text):
+        await add_voice(update)   # never kept in a conversation
+        return
     space = await resolve(update, context)
     if not space: return
     if space.persona == PARLIAMENT:
@@ -357,7 +561,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = update.effective_user
     message_id = await save_incoming(user, space.persona, update.effective_message.text)
-    async with typing(context.bot, space):
+    async with typing(space, lambda: [space.persona]):
         await asyncio.sleep(DEBOUNCE_SECONDS)
         async with brain.conversation_lock(user.id, space.persona):
             if await db.call(memory.latest_user_message_id, user.id, space.persona) != message_id:
@@ -369,7 +573,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply = prompts.ERROR_TEXT
             if reply not in (prompts.ERROR_TEXT, prompts.REFUSAL_TEXT):
                 await db.call(memory.save_message, user.id, space.persona, "assistant", reply)
-            await send_text(context.bot, space, reply)
+            await answer(space, reply)
             logger.info(f"Reply sent by {space.persona} ({len(reply)} chars)")
     memory.consolidate_soon(user.id, space.persona)
 
@@ -387,7 +591,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 _rounds: dict[int, asyncio.Task] = {}
-_keyboards: dict[int, tuple] = {}   # user -> (chat_id, message_id) of the message carrying the buttons
+_keyboards: dict[int, object] = {}  # user -> the message carrying the buttons
 
 ROUND_BUTTONS = InlineKeyboardMarkup([
     [InlineKeyboardButton("🗣️ תדונו ביניכם", callback_data="parl:debate"),
@@ -407,17 +611,16 @@ BUTTON_PLANS = {
 }
 
 
-async def _move_buttons(bot, user_id, message, markup):
-    """Only the latest round carries the buttons."""
+async def _move_buttons(user_id, message, markup):
+    """Only the latest round carries the buttons. (Each message is edited by the bot that sent it.)"""
     previous = _keyboards.pop(user_id, None)
-    if previous:
+    if previous is not None:
         with contextlib.suppress(Exception):
-            await bot.edit_message_reply_markup(chat_id=previous[0], message_id=previous[1], reply_markup=None)
+            await previous.edit_reply_markup(reply_markup=None)
     if message is not None and markup is not None:
         with contextlib.suppress(Exception):
-            await bot.edit_message_reply_markup(chat_id=message.chat_id, message_id=message.message_id,
-                                                reply_markup=markup)
-            _keyboards[user_id] = (message.chat_id, message.message_id)
+            await message.edit_reply_markup(reply_markup=markup)
+            _keyboards[user_id] = message
 
 
 def interrupt(user_id):
@@ -427,22 +630,26 @@ def interrupt(user_id):
         task.cancel()
 
 
-async def run_parliament(bot, space, user, plan, trigger_message):
-    """Carry out a plan in the parliament topic, sending each speaker's words as they come."""
+async def run_parliament(space, user, plan, trigger_message):
+    """Carry out a plan in the parliament topic, each speaker sending his words through his own bot."""
     last = None
+    writing = set()
+
+    def show(speaker, on):
+        (writing.add if on else writing.discard)(speaker)
 
     async def emit(speaker, text):
         nonlocal last
-        header = html.escape(speaker_title(speaker), quote=False)
-        last = await send_text(bot, space, f"<b>{header}</b>\n{html.escape(text, quote=False)}", ParseMode.HTML)
+        writing.discard(speaker)
+        last = await post(space, speaker, text)
         await db.call(memory.save_message, user.id, PARLIAMENT, "assistant", text, "chat", speaker)
 
     interrupt(user.id)
     async with brain.conversation_lock(user.id, PARLIAMENT):
-        task = asyncio.create_task(parliament.respond(user.id, user.first_name, plan, emit))
+        task = asyncio.create_task(parliament.respond(user.id, user.first_name, plan, emit, show))
         _rounds[user.id] = task
         try:
-            async with typing(bot, space):
+            async with typing(space, lambda: writing):
                 outcome = await task
         except asyncio.CancelledError:
             if task.cancelled() and not asyncio.current_task().cancelling():
@@ -450,19 +657,19 @@ async def run_parliament(bot, space, user, plan, trigger_message):
             raise
         except Exception:
             logger.exception("Parliament round failed")
-            await send_text(bot, space, prompts.ERROR_TEXT)
+            await post(space, voices.CHAIR, prompts.ERROR_TEXT)
             return
         finally:
             if _rounds.get(user.id) is task:
                 del _rounds[user.id]
     if outcome == "round":
-        await _move_buttons(bot, user.id, last, ROUND_BUTTONS)
+        await _move_buttons(user.id, last, ROUND_BUTTONS)
     elif outcome == "paused":
-        await _move_buttons(bot, user.id, await send_text(bot, space, prompts.DEBATE_PAUSED), PAUSE_BUTTONS)
+        await _move_buttons(user.id, await post(space, voices.CHAIR, prompts.DEBATE_PAUSED), PAUSE_BUTTONS)
     elif outcome == "silent":
-        await react(bot, trigger_message, "✍")
+        await react(trigger_message, "✍")
     elif outcome == "ack":
-        await react(bot, trigger_message, "👌")
+        await react(trigger_message, "👌")
     memory.consolidate_soon(user.id, PARLIAMENT)
 
 
@@ -478,7 +685,7 @@ async def handle_parliament(update, context, space):
     _, window, _ = await db.call(parliament.load, user.id)
     plan = await parliament.route(text, state, window, user.first_name)
     logger.info(f"Parliament plan: {plan}")
-    await run_parliament(context.bot, space, user, plan, update.effective_message)
+    await run_parliament(space, user, plan, update.effective_message)
 
 
 async def on_parliament_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -501,7 +708,7 @@ async def on_parliament_button(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         return
     await save_incoming(query.from_user, PARLIAMENT, label, "action")
-    await run_parliament(context.bot, space, query.from_user, plan, query.message)
+    await run_parliament(space, query.from_user, plan, query.message)
 
 # ============================================================
 # MESSAGES THE PERSONAS SEND ON THEIR OWN
@@ -513,6 +720,8 @@ _due_lock = asyncio.Lock()
 async def deliver(reminder):
     user_id, persona = reminder["user_id"], reminder["persona"]
     space = await db.call(spaces.home, user_id, persona) if user_id == ALLOWED_USER_ID else None
+    if space is None and user_id == ALLOWED_USER_ID and voices.own_bot(persona):
+        space = Space(user_id, None, persona)   # no topic for him: his own bot's private chat
     if space is None or persona not in personas.BY_KEY:
         await db.call(reminders.finish, reminder["id"], "cancelled")
         return
@@ -529,7 +738,7 @@ async def deliver(reminder):
         text = await brain.compose_proactive(user_id, reminder["first_name"], reminder)
         if not text:
             raise RuntimeError("empty proactive message")
-        await send_text(bot_app.bot, space, text)
+        await post(space, persona, text)
         await db.call(memory.save_message, user_id, persona, "assistant", text, "proactive")
     await db.call(reminders.finish, reminder["id"], "sent")
     logger.info(f"Reminder {reminder['id']} ({persona}, {reminder['kind']}) sent")
@@ -585,7 +794,8 @@ async def set_webhook():
         logger.error("No public URL known - set PUBLIC_URL so Telegram can reach the bot")
         return
     # One connection at a time, so Telegram delivers his messages in order.
-    await bot_app.bot.set_webhook(f"{public_url}/webhook", secret_token=TELEGRAM_SECRET_TOKEN, max_connections=1)
+    await bot_app.bot.set_webhook(f"{public_url}/webhook", secret_token=TELEGRAM_SECRET_TOKEN, max_connections=1,
+                                  allowed_updates=voices.ALLOWED_UPDATES)
     logger.info(f"Webhook set: {public_url}/webhook")
 
 
@@ -606,21 +816,27 @@ async def lifespan(app: FastAPI):
                           ("clear", cmd_clear), ("help", cmd_help)):
         bot_app.add_handler(CommandHandler(name, handler))
     bot_app.add_handler(CallbackQueryHandler(on_parliament_button, pattern=r"^parl:"))
+    bot_app.add_handler(CallbackQueryHandler(on_voice_button, pattern=r"^voice:"))
+    bot_app.add_handler(ChatMemberHandler(on_my_member, ChatMemberHandler.MY_CHAT_MEMBER))
     bot_app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND, handle_message))
     bot_app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & MEDIA, handle_other))
     bot_app.add_error_handler(on_error)
     await bot_app.initialize()
+    await voices.load(bot_app.bot)
     await bot_app.start()
     try:
         await set_webhook()
     except Exception:
         logger.exception("Setting the webhook failed")
     loops = [asyncio.create_task(reminders_loop()), asyncio.create_task(memory_loop())]
+    if public_url:
+        loops.append(asyncio.create_task(voices.set_webhooks(voice_url, TELEGRAM_SECRET_TOKEN)))
     yield
     for task in loops:
         task.cancel()
     await bot_app.stop()
     await bot_app.shutdown()
+    await voices.close()
 
 
 fastapi_app = FastAPI(lifespan=lifespan)
@@ -632,17 +848,38 @@ def _matches(given, expected):
     return hmac.compare_digest(given.encode(), expected.encode())
 
 
+def _authorized(request):
+    return _matches(request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""), TELEGRAM_SECRET_TOKEN)
+
+
+async def _receive(request, key, bot):
+    data = await request.json()
+    seen = (key, data.get("update_id"))   # every bot numbers its updates separately
+    if seen in _seen_updates:
+        return Response("duplicate")
+    _seen_updates.append(seen)
+    update = Update.de_json(data, bot)
+    if key == voices.MAIN or voices.wanted(update):
+        await bot_app.update_queue.put(update)
+    return Response("ok")
+
+
 @fastapi_app.post("/webhook")
 async def webhook(request: Request):
-    if not _matches(request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""), TELEGRAM_SECRET_TOKEN):
+    if not _authorized(request):
         return Response("unauthorized", status_code=403)
-    data = await request.json()
-    update_id = data.get("update_id")
-    if update_id in _seen_updates:
-        return Response("duplicate")
-    _seen_updates.append(update_id)
-    await bot_app.update_queue.put(Update.de_json(data, bot_app.bot))
-    return Response("ok")
+    return await _receive(request, voices.MAIN, bot_app.bot)
+
+
+@fastapi_app.post("/webhook/{key}")
+async def voice_webhook(key: str, request: Request):
+    """Updates for a persona's own bot."""
+    if not _authorized(request):
+        return Response("unauthorized", status_code=403)
+    bot = voices.own_bot(key)
+    if bot is None:  # not connected (yet) - Telegram will try again later
+        return Response("unknown bot", status_code=503 if key in voices.KEYS else 404)
+    return await _receive(request, key, bot)
 
 
 @fastapi_app.api_route("/tick", methods=["GET", "POST"])
