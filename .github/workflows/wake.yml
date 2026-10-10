@@ -1,0 +1,29 @@
+name: Wake the bot
+
+# Render's free plan puts the bot to sleep after 15 idle minutes. An hourly wake-up lets it send
+# scheduled messages on time: when one is due soon, the bot keeps itself awake until it is sent.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wake the bot
+        run: curl -fsS --retry 4 --retry-delay 20 --retry-all-errors --max-time 120 https://frankl-bot.onrender.com/health
+
+      - name: Keep this schedule enabled
+        # GitHub disables scheduled workflows after 60 days without commits; re-enabling once a day prevents that.
+        if: github.event_name == 'schedule'
+        run: |
+          if [ "$(date -u +%H)" = "03" ]; then
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/wake.yml/enable"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}

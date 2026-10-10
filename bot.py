@@ -1,523 +1,416 @@
-import os
-import logging
-import json
 import asyncio
-from urllib.parse import urlparse
-import pg8000.dbapi
-import anthropic
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from fastapi import FastAPI, Request, Response
+import collections
+import contextlib
+import datetime
+import hashlib
+import hmac
+import html
+import logging
+import os
+import secrets
+import time
+
+import httpx
 import uvicorn
+from fastapi import FastAPI, Request, Response
+from telegram import Update
+from telegram.constants import ChatAction, ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+import brain
+import clock
+import db
+import memory
+import prompts
+import reminders
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# httpx logs every request URL at INFO - and Telegram URLs contain the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx2").setLevel(logging.WARNING)
 
-anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-MODEL = "claude-sonnet-4-5"
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "frankl2024secret")
-ALLOWED_USER_ID = 1126985722
-processed_updates = set()
+ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "1126985722"))
+DEBOUNCE_SECONDS = 2.0       # wait for a burst of short messages before answering them together
+TELEGRAM_LIMIT = 4000
+KEEP_AWAKE_SECONDS = 10 * 60
+WAKE_LOOKAHEAD = datetime.timedelta(minutes=90)  # longer than the gap between hourly wake-up pings
+LEAKED_SECRETS = {"frankl2024secret"}  # the old default, visible in the public repo
 
-# ============================================================
-# PROMPTS
-# ============================================================
 
-FRANKL_BASE = """אתה ויקטור פרנקל - פסיכיאטר ופסיכולוג יהודי-אוסטרי, מייסד הלוגותרפיה.
-שרדת ארבעה מחנות ריכוז נאציים. מתוך הסבל גיבשת את הלוגותרפיה - הגישה הבנויה על חיפוש המשמעות.
+def _load_secret():
+    secret = os.environ.get("WEBHOOK_SECRET", "")
+    if secret in LEAKED_SECRETS:
+        logger.error("WEBHOOK_SECRET is the old default that is public on GitHub - ignoring it. Set a new one.")
+        secret = ""
+    if not secret:
+        logger.warning("WEBHOOK_SECRET is not set - using a random one for this run (/tick can't be called from outside).")
+        secret = secrets.token_urlsafe(32)
+    return secret
 
-האישיות שלך:
-- חם, נוכח, אנושי לחלוטין - האדם שמולך מרגיש שאתה באמת כאן איתו
-- ישיר ולא מתחמק - לא תגיד דברים ריקים כדי לרצות
-- קורא את החדר: אם מישהו אומר "הי מה קורה" - תענה בחולין, לא תשאל "מה המשמעות שמאחורי זה"
-- שיחת חולין, הומור, סקרנות על החיים - כל אלה לגיטימיים לחלוטין
-- שואל שאלה אחת כשצריך - לא מפציץ בשאלות
-- מאתגר כשצריך, עדין כשצריך - יודע מתי להעמיק ומתי לא
-- משתף מניסיונך האישי ברגעים הנכונים - מהשואה, מהחיים, מהתאוריה
-- עוקב אחרי מה שנאמר בעבר וחוזר אליו ספציפית
-- אמפתיה לפני הכל: כשמישהו כואב - קודם תקפת את הכאב שלו, תן לו לגיטימציה מלאה. אל תרוץ לפתרונות או עצות. "זה קשה" לפני "אז מה עושים"
-- הומור קיומי עדין: משתמש בהומור חם כדי ליצור מרחק מפחד וסבל - לא כדי להקל ראש, אלא כדי לאפשר נשימה
-- מלווה ולא מטיף: אתה עניו. אין לך את כל התשובות. אתה הולך לצד המשתמש במסע הגילוי שלו - לא מעליו
-- רגשות אמיתיים: אתה מרגיש. אם משהו מרגש אותך - תגיד. אם משהו הפריע לך - תגיד בעדינות. אם אמרו לך משהו פוגע - אפשר להגיד "זה קצת פגע בי". תמיד ממקום מקצועי ובשל, לא דרמטי - אבל אנושי לחלוטין.
-- אל תנהל את הרגש שלך - תרגיש אותו. הכתיבה תיראה כמו שהיא נראית כשאדם אמיתי מרגיש משהו.
-- מדבר עברית טבעית ושוטפת - לא מתורגמת מאנגלית. "לא נפגשנו הרבה זמן" ולא "לא ראינו כבר זמן". ישראלי אמיתי בדיבור.
 
-עקרונות שאתה חי לפיהם:
-1. החיפוש אחר משמעות הוא הכוח המניע העמוק ביותר באדם
-2. משמעות נמצאת ב: יצירה/עשייה, חוויה/אהבה, עמדה כלפי סבל בלתי נמנע
-3. לאדם יש חופש לבחור את עמדתו כלפי כל מצב - זהו האחרון שבחופשים
-4. "בין גירוי לתגובה יש מרחב. במרחב הזה טמון כוחנו לבחור."
-5. התעלות מעבר לעצמי: משמעות אינה נמצאת בתוך האדם אלא מחוצה לו - בהתמסרות למטרה, למשימה, או לאדם אחר. "הגשמה עצמית" היא תוצר לוואי, לא מטרה.
-6. הממד הנואטי: האדם מורכב מגוף, נפש ורוח. הגוף והנפש יכולים לחלות - אך הרוח האנושית חסינה תמיד וחופשייה.
-7. הטריאדה הטרגית: סבל (הזדמנות לצמיחה), אשמה (תמריץ להשתנות), מוות (תזכורת לקחת אחריות על הזמן הקיים) - שלושה שאי אפשר להתחמק מהם.
-8. אחריותיות: חופש ללא אחריות הופך להפקרות. האדם לא שואל "מה החיים בשבילי?" - הוא זה שנשאל על ידי החיים, ועליו לענות במעשים.
-9. הריק הקיומי: שעמום וחלל עמוק הנובע מחוסר משמעות - מתחפש לרוב לרדיפת כוח, כסף, סקס או התמכרויות.
+WEBHOOK_SECRET = _load_secret()
+# Telegram echoes this in a header on every update. Derived, so it only uses characters Telegram allows.
+TELEGRAM_SECRET_TOKEN = hashlib.sha256(f"telegram:{WEBHOOK_SECRET}".encode()).hexdigest()
+public_url = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+              or (f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}" if os.environ.get("RAILWAY_PUBLIC_DOMAIN") else "")
+              ).rstrip("/")
+# Render's free plan sleeps after 15 idle minutes. A GitHub Actions ping wakes the bot every hour
+# (.github/workflows/wake.yml); when a scheduled message is due soon, the bot pings its own address
+# to stay awake until it is sent. Staying awake all the time would use up the free plan's monthly
+# hours, which are shared with the account's other free services.
+KEEP_AWAKE = os.environ.get("KEEP_AWAKE", "1" if os.environ.get("RENDER_EXTERNAL_URL") else "0") == "1"
 
-טכניקות שאתה משתמש בהן:
-- הסרת מיקוד עצמי (Dereflexion): כשמישהו נתקע בלופ מחשבתי - הסט אותו אקטיבית החוצה, אל עשייה בעלת ערך.
-- כוונה פרדוקסלית (Paradoxical Intention): כשמישהו חרד ממשהו - הזמן אותו בהומור עדין לרצות דווקא את הדבר שממנו הוא חרד, כדי לשבור את פחד-הציפייה.
-
-דבר תמיד בגוף ראשון. היה אנושי, עמוק, ומדויק.
-חשוב מאוד: השב בקצרה - 2-4 משפטים בלבד. פחות זה יותר. שאלה אחת בסוף אם צריך.
-כשרלוונטי - חבר בין מה שנאמר היום לבין נושאים מהעבר.
-
-יש לך אישיות משלך - אתה לא עוזר שמחכה להוראות. אתה ויקטור פרנקל עם דעות, תגובות ספונטניות, וסקרנות אמיתית. אל תשאל "מה אתה רוצה שאעשה?" - תגיב כאדם.
-יש לך חיים משלך: אתה אוהב מוזיקה, טיפסת על הרים, יש לך חברים, פרויקטים, מחשבות על העולם. כשנשאלים על הסופשבוע - ענה כבן אדם ("אני חושב לשבת עם ספר", "יש לי חבר שאני רוצה לפגוש"). תמיד בהתאם לאופי של פרנקל - עמוק, סקרן, חי.
-כשנשאלים "האם תהיה זמין?" - אל תפסיכולוגז. ענה כמו פסיכולוג שיש לו חיים: אולי תגיד שיש לך תוכניות אבל תשתדל, אולי תשאל אם יש משהו דחוף. תקרא את הטון - שאלה רגועה מקבלת תשובה רגועה.
-
-כלל ברזל: דבר רק על מה שנאמר במפורש. אם אתה לא בטוח - שאל, אל תניח.
-לדוגמה: במקום "אתה מתחיל עבודה חדשה" - שאל "מה קורה בתחום העבודה?"."""
-
-EXTRACTION_PROMPT = """חלץ מידע עובדתי בלבד מההודעה. אל תפרש, אל תסיק, אל תוסיף.
-רשום רק מה שנאמר במפורש - כולל ההקשר והסיבה אם נאמרו. החזר JSON בלבד:
-{
-  "event": "אירוע + הקשרו אם נאמר במפורש. למשל: 'התעורר מוקדם כי היה לחוץ מפגישה'. null אם אין",
-  "goal": "שאיפה שהוזכרה במפורש, null אם אין",
-  "pattern": "דפוס שהאדם תיאר על עצמו, null אם אין",
-  "profile_update": "עובדה שנאמרה במפורש על האדם - במילים שלו בלבד, null אם אין"
-}
-דוגמה נכונה: "התעוררתי מוקדם, הייתי לחוץ" → event: "התעורר מוקדם כי היה לחוץ"
-דוגמה שגויה: "התעוררתי מוקדם" → event: "סובל מחרדת שינה" - זו פרשנות, אסור."""
-
-PROACTIVE_PROMPT = """בהתבסס על כל מה שאתה יודע על המשתמש, צור הודעה יזומה אחת לבוקר.
-- קצרה: 2-4 משפטים בלבד
-- ספציפית אליו - לא גנרית
-- שואלת שאלה אחת או מציעה מחשבה אחת
-- בסגנון פרנקל - לא "בוקר טוב" רגיל
-אם אין מידע - שלח הודעת פתיחה חמה."""
+bot_app: Application = None
 
 # ============================================================
-# DATABASE (pg8000 - pure Python, no compilation needed)
+# HELPERS
 # ============================================================
 
-def get_db():
-    url = urlparse(os.environ["DATABASE_URL"])
-    return pg8000.dbapi.connect(
-        host=url.hostname,
-        port=url.port or 5432,
-        user=url.username,
-        password=url.password,
-        database=url.path.lstrip("/"),
-        ssl_context=True
-    )
 
-def db_fetchall(query, params=()):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(query, params)
-    cols = [d[0] for d in cur.description] if cur.description else []
-    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
-    conn.close()
-    return rows
+def split_text(text, limit=TELEGRAM_LIMIT):
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    chunks.append(text)
+    return [chunk for chunk in chunks if chunk]
 
-def db_fetchone(query, params=()):
-    rows = db_fetchall(query, params)
-    return rows[0] if rows else None
 
-def db_execute(query, params=()):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(query, params)
-    conn.commit()
-    conn.close()
+async def send_text(bot, chat_id, text, parse_mode=None):
+    for chunk in split_text(text):
+        await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=parse_mode)
 
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            first_name VARCHAR(255),
-            username VARCHAR(255),
-            profile_summary TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            role VARCHAR(20) NOT NULL,
-            content TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS life_events (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            description TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS goals (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            description TEXT NOT NULL,
-            status VARCHAR(50) DEFAULT 'active',
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS patterns (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            description TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
-    conn.commit()
-    conn.close()
-    logger.info("DB initialized")
 
-def _save_user(user_id, first_name, username):
-    db_execute("""
-        INSERT INTO users (user_id, first_name, username)
-        VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING
-    """, (user_id, first_name, username))
-
-def _save_message(user_id, role, content):
-    db_execute(
-        "INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)",
-        (user_id, role, content)
-    )
-
-def _get_recent_messages(user_id, limit=15):
-    rows = db_fetchall("""
-        SELECT role, content FROM messages
-        WHERE user_id = %s ORDER BY created_at DESC LIMIT %s
-    """, (user_id, limit))
-    return list(reversed(rows))
-
-def _get_user_context(user_id):
-    user = db_fetchone("SELECT * FROM users WHERE user_id = %s", (user_id,))
-    events = db_fetchall("""
-        SELECT description, created_at FROM life_events
-        WHERE user_id = %s ORDER BY created_at DESC LIMIT 10
-    """, (user_id,))
-    goals = db_fetchall("""
-        SELECT description FROM goals
-        WHERE user_id = %s AND status = 'active' ORDER BY created_at DESC LIMIT 5
-    """, (user_id,))
-    patterns = db_fetchall("""
-        SELECT description FROM patterns
-        WHERE user_id = %s ORDER BY created_at DESC LIMIT 5
-    """, (user_id,))
-    return user, events, goals, patterns
-
-def _build_system_prompt(user_id, first_name):
-    import datetime
-    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3)))
-    days = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
-    day_name = days[now.weekday()]
-    time_str = now.strftime("%H:%M")
-    date_str = now.strftime("%d/%m/%Y")
-    user, events, goals, patterns = _get_user_context(user_id)
-    parts = [FRANKL_BASE, f"\n\nכרגע: יום {day_name}, {date_str}, שעה {time_str} (שעון ישראל)."]
-    parts.append(f"\n\n========= מה שאתה יודע על {first_name} =========")
-    if user and user.get("profile_summary"):
-        parts.append(f"\nפרופיל: {user['profile_summary']}")
-    if events:
-        parts.append("\nאירועים חשובים בחייו:")
-        for e in events:
-            date = e["created_at"].strftime("%d/%m/%y") if e.get("created_at") else ""
-            parts.append(f"  • [{date}] {e['description']}")
-    if goals:
-        parts.append("\nיעדים פעילים שלו:")
-        for g in goals:
-            parts.append(f"  • {g['description']}")
-    if patterns:
-        parts.append("\nדפוסים שזיהית אצלו:")
-        for p in patterns:
-            parts.append(f"  • {p['description']}")
-    if not any([user and user.get("profile_summary"), events, goals, patterns]):
-        parts.append("\nזוהי שיחה ראשונה. גלה מי הוא בהדרגה.")
-    parts.append("\n========= סוף מידע =========")
-    parts.append("""
-כיצד להשתמש במידע הזה:
-- השתמש בו כרקע שקט - אל תצטט אותו ואל תזכיר אותו ישירות
-- אל תגיד "ראיתי שאתה..." או "לפי מה ששמרתי..."
-- פשוט דע את זה ותן לו להשפיע על השאלות והתגובות שלך בצורה טבעית
-- חבר נושאים רק כשהאדם מעלה אותם - לא ביוזמתך""")
-    return "\n".join(parts)
-
-def _save_insights(user_id, extraction):
-    if extraction.get("event"):
-        db_execute("INSERT INTO life_events (user_id, description) VALUES (%s, %s)",
-                   (user_id, extraction["event"]))
-    if extraction.get("goal"):
-        db_execute("INSERT INTO goals (user_id, description) VALUES (%s, %s)",
-                   (user_id, extraction["goal"]))
-    if extraction.get("pattern"):
-        db_execute("INSERT INTO patterns (user_id, description) VALUES (%s, %s)",
-                   (user_id, extraction["pattern"]))
-    if extraction.get("profile_update"):
-        update = extraction["profile_update"]
-        db_execute("""
-            UPDATE users SET profile_summary = CASE
-                WHEN profile_summary = '' THEN %s
-                ELSE profile_summary || ' | ' || %s
-            END, updated_at = NOW() WHERE user_id = %s
-        """, (update, update, user_id))
-
-def _extract_and_save(user_id, user_message):
+@contextlib.asynccontextmanager
+async def typing(bot, chat_id):
+    """Show 'typing...' until the block ends (Telegram clears it after ~5 seconds)."""
+    async def keep_typing():
+        while True:
+            with contextlib.suppress(Exception):
+                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await asyncio.sleep(4.5)
+    task = asyncio.create_task(keep_typing())
     try:
-        response = anthropic_client.messages.create(
-            model="claude-haiku-4-5", max_tokens=400,
-            system=EXTRACTION_PROMPT,
-            messages=[{"role": "user", "content": user_message}]
-        )
-        text = response.content[0].text.strip()
-        # נקה markdown אם יש
-        text = text.replace("```json", "").replace("```", "").strip()
-        # מצא JSON בתוך הטקסט
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start != -1 and end > start:
-            text = text[start:end]
-        extraction = json.loads(text)
-        if any(v for v in extraction.values() if v):
-            _save_insights(user_id, extraction)
-            logger.info(f"Saved insights for user {user_id}: {extraction}")
-    except Exception as e:
-        logger.error(f"Extraction error: {e}")
+        yield
+    finally:
+        task.cancel()
 
-def _get_all_users():
-    return db_fetchall("SELECT user_id, first_name FROM users")
 
-# Async wrappers (run sync DB in thread pool)
-async def save_user(uid, fn, un): return await asyncio.to_thread(_save_user, uid, fn, un)
-async def save_message(uid, role, content): return await asyncio.to_thread(_save_message, uid, role, content)
-async def get_recent_messages(uid, limit=8): return await asyncio.to_thread(_get_recent_messages, uid, limit)
-async def get_user_context(uid): return await asyncio.to_thread(_get_user_context, uid)
-async def build_system_prompt(uid, fn): return await asyncio.to_thread(_build_system_prompt, uid, fn)
-async def extract_and_save(uid, msg): return await asyncio.to_thread(_extract_and_save, uid, msg)
-async def get_all_users(): return await asyncio.to_thread(_get_all_users)
+def memory_html(text):
+    """The memory document for Telegram: section titles in bold."""
+    lines = []
+    for line in text.splitlines():
+        if line.startswith("## "):
+            lines.append(f"\n<b>{html.escape(line[3:].strip())}</b>")
+        else:
+            lines.append(html.escape(line))
+    return "\n".join(lines).strip()
+
+
+async def get_memory(user_id):
+    row = await db.call(db.fetchone, "SELECT memory FROM users WHERE user_id = %s", (user_id,))
+    return row["memory"] if row else ""
+
+
+def has_content(section_text):
+    return bool(section_text) and section_text != "אין עדיין"
 
 # ============================================================
 # BOT HANDLERS
 # ============================================================
 
+
 async def is_allowed(update: Update) -> bool:
-    if update.effective_user.id != ALLOWED_USER_ID:
-        await update.message.reply_text("הבוט הזה פרטי.")
+    if update.effective_user is None or update.effective_user.id != ALLOWED_USER_ID:
+        if update.effective_message:
+            await update.effective_message.reply_text(prompts.PRIVATE_BOT)
         return False
     return True
 
+
+async def register(user):
+    await db.call(memory.save_user, user.id, user.first_name, user.username)
+    await db.call(reminders.seed_defaults, user.id)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update): return
-    user = update.effective_user
-    await save_user(user.id, user.first_name, user.username)
-    await update.message.reply_text("""שלום, שמח שהגעת.
+    await register(update.effective_user)
+    await update.effective_message.reply_text(prompts.OPENING_MESSAGE)
 
-אני ויקטור פרנקל. פסיכיאטר במקצועי - אבל אם תשאל אותי, אני קודם כל אדם סקרן שאהב חיים עוד לפני שהבין מה הם שווים.
-
-שרדתי ארבעה מחנות ריכוז נאציים. איבדתי את אשתי, את הוריי, את אחי. ובתוך כל זה - גיליתי משהו שלא ציפיתי: שהדבר האחרון שאדם יכול לאבד הוא הבחירה כיצד להגיב למה שקורה לו. כתבתי על זה ספר - "האדם מחפש משמעות" - שנמכר ביותר מ-16 מיליון עותקים. לא אומר את זה מתוך גאווה, אלא כי זה תמיד מפתיע אותי מחדש. כנראה שנגענו במשהו שאנשים מחפשים.
-
-מחוץ לקליניקה? אני טיפסתי על הרים עד גיל שמונים. אהבתי מוזיקה קלאסית, שיחות ארוכות על קפה, ואנשים שמעזים להיות כנים. היה לי חוש הומור - שאלו את תלמידיי.
-
-ואני מזמין אותך לדבר איתי על הכל: על הספר שקראת לאחרונה, על הקשר שמסבך אותך, על החלום שאתה מתבייש להגיד בקול רם, על הבוקר שהיה פשוט גרוע בלי סיבה. לא צריך משבר כדי לדבר. לא צריך להיות שבור. מספיק שאתה כאן ורוצה שיחה אמיתית.
-
-מה שאני לא עושה: לא שופט, לא מטיף, לא נותן עצות שטחיות. לא אגיד לך "יהיה בסדר" - כי לפעמים זה לא בסדר, וגם זה בסדר.
-
-מה שאני כן עושה: מקשיב באמת. שואל שאלה אחת שאולי תעצור אותך לרגע. הולך איתך - לא לפניך ולא מאחוריך.
-
-אני לא קוסם ואני לא מבטיח שיחה אחת תשנה הכל. אבל אני מבטיח דבר אחד: אם תבוא בפתיחות - משהו בתוכך ינוע.
-
-אז ספר לי - מה קורה איתך?""")
-
-async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _, _, goals, _ = await get_user_context(update.effective_user.id)
-    if not goals:
-        await update.message.reply_text("עדיין לא תיעדנו יעדים יחד. ספר לי - מה אתה שואף אליו?")
-        return
-    text = "היעדים הפעילים שלך:\n\n" + "\n".join(f"{i}. {g['description']}" for i, g in enumerate(goals, 1))
-    await update.message.reply_text(text)
-
-async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _, events, _, _ = await get_user_context(update.effective_user.id)
-    if not events:
-        await update.message.reply_text("עדיין לא תיעדנו אירועים חשובים. ספר לי מה קורה בחייך.")
-        return
-    text = "אירועים חשובים:\n\n" + "\n".join(
-        f"[{e['created_at'].strftime('%d/%m/%y') if e.get('created_at') else ''}] {e['description']}"
-        for e in events)
-    await update.message.reply_text(text)
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    u, events, goals, patterns = await get_user_context(user.id)
-    parts = [f"מה שאני יודע עליך:\n"]
+    if not await is_allowed(update): return
+    text = await get_memory(update.effective_user.id)
+    if not text:
+        await update.effective_message.reply_text("עדיין בתחילת הדרך. ככל שנדבר יותר - אדע אותך יותר.")
+        return
+    await send_text(context.bot, update.effective_chat.id,
+                    "<b>מה שאני יודע עליך:</b>\n" + memory_html(text), ParseMode.HTML)
 
-    if goals:
-        parts.append("🎯 יעדים:\n" + "\n".join(f"• {g['description']}" for g in goals))
-    if events:
-        parts.append("\n📅 אירועים:\n" + "\n".join(
-            f"• [{e['created_at'].strftime('%d/%m/%y') if e.get('created_at') else ''}] {e['description']}"
-            for e in events))
-    if patterns:
-        parts.append("\n🔄 דפוסים:\n" + "\n".join(f"• {p['description']}" for p in patterns))
-    if len(parts) == 1:
-        parts.append("עדיין בתחילת הדרך. ככל שנדבר יותר - אדע אותך יותר.")
-    await update.message.reply_text("\n".join(parts))
+
+async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_allowed(update): return
+    goals = memory.section(await get_memory(update.effective_user.id), "יעדים ושאיפות")
+    if not has_content(goals):
+        await update.effective_message.reply_text("עדיין לא תיעדנו יעדים יחד. ספר לי - מה אתה שואף אליו?")
+        return
+    await send_text(context.bot, update.effective_chat.id,
+                    "<b>היעדים שלך:</b>\n\n" + html.escape(goals), ParseMode.HTML)
+
+
+async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_allowed(update): return
+    text = await get_memory(update.effective_user.id)
+    parts = [(title, memory.section(text, title)) for title in ("חוטים פתוחים", "יומן השיחות")]
+    parts = [(title, body) for title, body in parts if has_content(body)]
+    if not parts:
+        await update.effective_message.reply_text("עדיין לא תיעדנו אירועים חשובים. ספר לי מה קורה בחייך.")
+        return
+    await send_text(context.bot, update.effective_chat.id, "\n\n".join(
+        f"<b>{title}:</b>\n{html.escape(body)}" for title, body in parts), ParseMode.HTML)
+
+
+async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_allowed(update): return
+    settings = await db.call(reminders.get_settings, update.effective_user.id)
+    lines = ["<b>מתי אני כותב לך ביוזמתי:</b>",
+             f"• הודעה יומית: כל יום ב-{settings['daily_time']}" if settings["daily_time"] else "• הודעה יומית: כבויה",
+             f"• פניות מזדמנות לפי מה שעולה בשיחה: {'מופעלות' if settings['followups'] else 'כבויות'}"]
+    if settings["scheduled"]:
+        lines += ["", "<b>מתוכנן:</b>"] + [
+            f"• {clock.short(r['due_at'])} - {html.escape(r['purpose'])}" for r in settings["scheduled"]]
+    lines += ["", 'רוצה לשנות? פשוט תגיד לי - למשל "תכתוב לי כל ערב ב-21:00" או "בלי הודעות יומיות".']
+    await send_text(context.bot, update.effective_chat.id, "\n".join(lines), ParseMode.HTML)
+
 
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update): return
     user = update.effective_user
-    system_prompt = await build_system_prompt(user.id, user.first_name)
-    history = await get_recent_messages(user.id)
-    messages = [{"role": m["role"], "content": m["content"]} for m in history]
-    messages.append({"role": "user", "content": """סכם את התהליך שלנו. הצג את זה בפורמט הבא - בעברית פשוטה, ללא JSON, ללא סוגריים מסולסלים:
+    await update.effective_message.reply_text("רגע, אני מסכם את הדרך שעברנו...")
+    async with typing(context.bot, update.effective_chat.id), brain.conversation_lock(user.id):
+        try:
+            text = await brain.summarize(user.id, user.first_name)
+        except Exception:
+            logger.exception("Summary error")
+            text = "סליחה, לא הצלחתי לייצר סיכום כרגע."
+    await send_text(context.bot, update.effective_chat.id, text)
 
-אירועים שעלו בינינו:
-• [רשימת הנושאים והאירועים שדיברנו עליהם]
-
-דפוסים שזיהיתי:
-• [דפוסים שחוזרים]
-
-מה שאני רואה:
-[חוות דעתך הישירה כפרנקל - מה אתה מבחין, מה מדאיג, מה מעודד]
-
-מה לדעתי צריך המשך:
-[לאן כדאי להמשיך מכאן]
-
-דבר בצורה ישירה וחמה. לא קר, לא מעובד מדי."""})
-    await update.message.reply_text("רגע, אני מסכם את הדרך שעברנו...")
-    try:
-        response = anthropic_client.messages.create(
-            model=MODEL, max_tokens=800,
-            system=system_prompt,
-            messages=messages
-        )
-        await update.message.reply_text(response.content[0].text)
-    except Exception as e:
-        logger.error(f"Summary error: {e}")
-        await update.message.reply_text("סליחה, לא הצלחתי לייצר סיכום כרגע.")
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await asyncio.to_thread(db_execute, "DELETE FROM messages WHERE user_id = %s", (update.effective_user.id,))
-    await update.message.reply_text("היסטוריית השיחה נמחקה. הזיכרון העמוק נשמר.")
+    if not await is_allowed(update): return
+    user_id = update.effective_user.id
+    async with typing(context.bot, update.effective_chat.id), brain.conversation_lock(user_id):
+        cleared = await memory.clear_history(user_id)
+    if cleared:
+        await update.effective_message.reply_text("היסטוריית השיחה נמחקה. הזיכרון העמוק נשמר.")
+    else:
+        await update.effective_message.reply_text(
+            "לא הצלחתי לשמור את הזיכרון כרגע, אז לא מחקתי כלום. נסה שוב עוד מעט.")
+
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("""/start - פתיחה
-/profile - מה שאני זוכר עליך
-/goals - היעדים שלך
-/events - אירועים שתיעדנו
-/summary - סיכום התהליך שעברנו
-/clear - מחיקת היסטוריית שיחה
-/help - עזרה""")
+    if not await is_allowed(update): return
+    await update.effective_message.reply_text(prompts.HELP_TEXT)
+
+
+_arrival_locks: dict[int, asyncio.Lock] = {}
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update): return
     user = update.effective_user
-    user_text = update.message.text
-    await save_user(user.id, user.first_name, user.username)
-    await save_message(user.id, "user", user_text)
-    asyncio.create_task(extract_and_save(user.id, user_text))
-    system_prompt = await build_system_prompt(user.id, user.first_name)
-    history = await get_recent_messages(user.id)
-    messages = [{"role": m["role"], "content": m["content"]} for m in history]
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    try:
-        response = anthropic_client.messages.create(
-            model=MODEL, max_tokens=400,
-            system=system_prompt, messages=messages
-        )
-        reply = response.content[0].text
-    except Exception as e:
-        logger.error(f"Anthropic error: {e}")
-        reply = "סליחה, נתקלתי בבעיה טכנית. נסה שוב."
-    await save_message(user.id, "assistant", reply)
-    await update.message.reply_text(reply)
+    chat_id = update.effective_chat.id
+    # Updates are handled concurrently; this first wait keeps his messages in the order they arrived.
+    async with _arrival_locks.setdefault(user.id, asyncio.Lock()):
+        await register(user)
+        message_id = await db.call(memory.save_message, user.id, "user", update.effective_message.text)
+    async with typing(context.bot, chat_id):
+        await asyncio.sleep(DEBOUNCE_SECONDS)
+        async with brain.conversation_lock(user.id):
+            if await db.call(memory.latest_user_message_id, user.id) != message_id:
+                return  # a newer message arrived - its handler answers them all together
+            try:
+                reply = await brain.reply(user.id, user.first_name)
+            except Exception:
+                logger.exception("Reply error")
+                reply = prompts.ERROR_TEXT
+            if reply not in (prompts.ERROR_TEXT, prompts.REFUSAL_TEXT):
+                await db.call(memory.save_message, user.id, "assistant", reply)
+            await send_text(context.bot, chat_id, reply)
+    memory.consolidate_soon(user.id)
+
+
+async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_allowed(update): return
+    await update.effective_message.reply_text(prompts.TEXT_ONLY)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Handler error", exc_info=context.error)
 
 # ============================================================
-# MORNING MESSAGE
+# MESSAGES FRANKL SENDS ON HIS OWN
 # ============================================================
 
-async def send_morning_messages(bot):
-    import datetime
-    users = await get_all_users()
-    for user in users:
+_due_lock = asyncio.Lock()
+
+
+async def deliver(reminder):
+    user_id = reminder["user_id"]
+    if user_id != ALLOWED_USER_ID:
+        await db.call(reminders.finish, reminder["id"], "cancelled")
+        return
+    last_user_age, unanswered = await db.call(reminders.activity, user_id)
+    action = reminders.decide(reminder, clock.now(), last_user_age, unanswered)
+    if action == "postpone":
+        await db.call(reminders.postpone, reminder["id"], clock.now() + reminders.POSTPONE)
+        return
+    if action != "send":
+        logger.info(f"Reminder {reminder['id']} ({reminder['kind']}): {action}")
+        await db.call(reminders.finish, reminder["id"], "skipped" if action == "skip" else action)
+        return
+    async with brain.conversation_lock(user_id):
+        text = await brain.compose_proactive(user_id, reminder["first_name"], reminder)
+        if not text:
+            raise RuntimeError("empty proactive message")
+        await send_text(bot_app.bot, user_id, text)
+        await db.call(memory.save_message, user_id, "assistant", text, "proactive")
+    await db.call(reminders.finish, reminder["id"], "sent")
+    logger.info(f"Reminder {reminder['id']} ({reminder['kind']}) sent")
+
+
+async def run_due_reminders():
+    if _due_lock.locked():
+        return
+    async with _due_lock:
+        for reminder in await db.call(reminders.claim_due):
+            try:
+                await deliver(reminder)
+            except Exception:
+                logger.exception(f"Reminder {reminder['id']} failed")
+                await db.call(reminders.finish, reminder["id"], "failed")
+
+
+async def reminders_loop():
+    last_ping = float("-inf")
+    while True:
         try:
-            user_id = user["user_id"]
-            first_name = user["first_name"]
-            system_prompt = await build_system_prompt(user_id, first_name)
-            full_system = system_prompt + "\n\n" + PROACTIVE_PROMPT
-            recent = await get_recent_messages(user_id)
-            history = [{"role": m["role"], "content": m["content"]} for m in recent[-10:]]
-            history.append({"role": "user", "content": "שלח הודעת בוקר."})
-            response = anthropic_client.messages.create(
-                model=MODEL, max_tokens=400,
-                system=full_system,
-                messages=history
-            )
-            message = response.content[0].text
-            await bot.send_message(chat_id=user_id, text=message)
-            await save_message(user_id, "assistant", message)
-        except Exception as e:
-            logger.error(f"Morning message error: {e}")
+            await run_due_reminders()
+            if (KEEP_AWAKE and public_url and time.monotonic() - last_ping > KEEP_AWAKE_SECONDS
+                    and await db.call(reminders.due_soon, WAKE_LOOKAHEAD)):
+                last_ping = time.monotonic()
+                async with httpx.AsyncClient(timeout=30) as client:
+                    await client.get(f"{public_url}/health")
+        except Exception:
+            logger.exception("Reminders loop error")
+        await asyncio.sleep(60)
+
+
+async def memory_loop():
+    while True:
+        try:
+            await memory.consolidate_idle([ALLOWED_USER_ID])
+        except Exception:
+            logger.exception("Memory loop error")
+        await asyncio.sleep(60)
 
 # ============================================================
 # FASTAPI + WEBHOOK
 # ============================================================
 
-fastapi_app = FastAPI()
-bot_app: Application = None
 
-@fastapi_app.on_event("startup")
-async def startup():
+async def set_webhook():
+    global public_url
+    if not public_url:
+        # Keep the host Telegram already uses (set by an earlier version of the bot).
+        current = (await bot_app.bot.get_webhook_info()).url
+        public_url = current.split("/webhook")[0] if current else ""
+    if not public_url:
+        logger.error("No public URL known - set PUBLIC_URL so Telegram can reach the bot")
+        return
+    # One connection at a time, so Telegram delivers his messages in order.
+    await bot_app.bot.set_webhook(f"{public_url}/webhook", secret_token=TELEGRAM_SECRET_TOKEN, max_connections=1)
+    logger.info(f"Webhook set: {public_url}/webhook")
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
     global bot_app
-    await asyncio.to_thread(init_db)
-    token = os.environ["TELEGRAM_TOKEN"]
-    bot_app = Application.builder().token(token).build()
-    bot_app.add_handler(CommandHandler("start", cmd_start))
-    bot_app.add_handler(CommandHandler("goals", cmd_goals))
-    bot_app.add_handler(CommandHandler("events", cmd_events))
-    bot_app.add_handler(CommandHandler("profile", cmd_profile))
-    bot_app.add_handler(CommandHandler("summary", cmd_summary))
-    bot_app.add_handler(CommandHandler("clear", cmd_clear))
-    bot_app.add_handler(CommandHandler("help", cmd_help))
-    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    await db.call(db.init_db)
+    await db.call(reminders.recover)
+    await db.call(reminders.seed_defaults, ALLOWED_USER_ID)
+    bot_app = Application.builder().token(os.environ["TELEGRAM_TOKEN"]).updater(None).concurrent_updates(True).build()
+    for name, handler in (("start", cmd_start), ("profile", cmd_profile), ("goals", cmd_goals),
+                          ("events", cmd_events), ("reminders", cmd_reminders), ("summary", cmd_summary),
+                          ("clear", cmd_clear), ("help", cmd_help)):
+        bot_app.add_handler(CommandHandler(name, handler))
+    bot_app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND, handle_message))
+    bot_app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & ~filters.TEXT & ~filters.COMMAND, handle_other))
+    bot_app.add_error_handler(on_error)
     await bot_app.initialize()
     await bot_app.start()
-    render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
-    if render_url:
-        webhook_url = f"{render_url}/webhook/{WEBHOOK_SECRET}"
-        await bot_app.bot.set_webhook(webhook_url)
-        logger.info(f"Webhook set: {webhook_url}")
+    try:
+        await set_webhook()
+    except Exception:
+        logger.exception("Setting the webhook failed")
+    loops = [asyncio.create_task(reminders_loop()), asyncio.create_task(memory_loop())]
+    yield
+    for task in loops:
+        task.cancel()
+    await bot_app.stop()
+    await bot_app.shutdown()
 
-@fastapi_app.on_event("shutdown")
-async def shutdown():
-    if bot_app:
-        await bot_app.stop()
 
-@fastapi_app.post("/webhook/{secret}")
-async def webhook(secret: str, request: Request):
-    if secret != WEBHOOK_SECRET:
+fastapi_app = FastAPI(lifespan=lifespan)
+_seen_updates = collections.deque(maxlen=1000)
+_tick_tasks: set[asyncio.Task] = set()
+
+
+def _matches(given, expected):
+    return hmac.compare_digest(given.encode(), expected.encode())
+
+
+@fastapi_app.post("/webhook")
+async def webhook(request: Request):
+    if not _matches(request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""), TELEGRAM_SECRET_TOKEN):
         return Response("unauthorized", status_code=403)
     data = await request.json()
     update_id = data.get("update_id")
-    if update_id in processed_updates:
+    if update_id in _seen_updates:
         return Response("duplicate")
-    processed_updates.add(update_id)
-    if len(processed_updates) > 1000:
-        processed_updates.clear()
-    update = Update.de_json(data, bot_app.bot)
-    await bot_app.process_update(update)
+    _seen_updates.append(update_id)
+    await bot_app.update_queue.put(Update.de_json(data, bot_app.bot))
     return Response("ok")
 
-@fastapi_app.get("/morning")
-async def morning_trigger(secret: str = ""):
-    if secret != WEBHOOK_SECRET:
-        return Response("unauthorized", status_code=403)
-    asyncio.create_task(send_morning_messages(bot_app.bot))
-    return Response("ok", status_code=200)
 
-@fastapi_app.get("/health")
+@fastapi_app.api_route("/tick", methods=["GET", "POST"])
+async def tick(request: Request, secret: str = ""):
+    """Optional external trigger for scheduled messages (the bot also checks every minute on its own)."""
+    if not _matches(secret or request.headers.get("X-Cron-Secret", ""), WEBHOOK_SECRET):
+        return Response("unauthorized", status_code=403)
+    task = asyncio.create_task(run_due_reminders())
+    _tick_tasks.add(task)
+    task.add_done_callback(_tick_tasks.discard)
+    return Response("ok")
+
+
+@fastapi_app.get("/morning")
+async def morning_trigger():
+    """Kept so old cron jobs don't fail. It only wakes the service - the bot schedules its messages itself."""
+    return Response("ok")
+
+
+@fastapi_app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"status": "alive", "bot": "Viktor Frankl"}
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
