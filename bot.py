@@ -244,6 +244,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if reply not in (prompts.ERROR_TEXT, prompts.REFUSAL_TEXT):
                 await db.call(memory.save_message, user.id, "assistant", reply)
             await send_text(context.bot, chat_id, reply)
+            logger.info(f"Reply sent ({len(reply)} chars)")
     memory.consolidate_soon(user.id)
 
 
