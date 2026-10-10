@@ -28,6 +28,7 @@ import personas
 import prompts
 import reminders
 import spaces
+import usage
 import voices
 from spaces import Space
 
@@ -209,8 +210,8 @@ async def resolve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat.type == "private":
         key = voices.key_of(update.get_bot())   # the main bot's private chat is Frankl's
-        if key == voices.CHAIR:
-            await update.effective_message.reply_text(prompts.CHAIR_PRIVATE)
+        if key == voices.CHAIR:  # the chair has no conversation of his own - privately, he reports the usage
+            await update.effective_message.reply_text(await db.call(usage.report))
             return None
         return Space(chat.id, None, key) if key else None
     message = update.effective_message
@@ -556,6 +557,13 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "לא הצלחתי לשמור את הזיכרון כרגע, אז לא מחקתי כלום. נסה שוב עוד מעט.")
 
 
+async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """How many tokens were used - the chair reports (in a private chat, whoever it belongs to)."""
+    space = await command_space(update, context)
+    if not space: return
+    await post(space, speaker_of(space) if space.private else voices.CHAIR, await db.call(usage.report))
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_allowed(update): return
     await update.effective_message.reply_text(prompts.HELP_TEXT)
@@ -695,6 +703,8 @@ async def run_parliament(space, user, plan, trigger_message):
         await react(trigger_message, "✍")
     elif outcome == "ack":
         await react(trigger_message, "👌")
+    elif outcome == "usage":  # not part of the meeting record
+        await post(space, voices.CHAIR, await db.call(usage.report))
     memory.consolidate_soon(user.id, PARLIAMENT)
 
 
@@ -838,7 +848,7 @@ async def lifespan(app: FastAPI):
     bot_app = Application.builder().token(os.environ["TELEGRAM_TOKEN"]).updater(None).concurrent_updates(True).build()
     for name, handler in (("start", cmd_start), ("setup", cmd_setup), ("profile", cmd_profile), ("goals", cmd_goals),
                           ("events", cmd_events), ("reminders", cmd_reminders), ("summary", cmd_summary),
-                          ("clear", cmd_clear), ("help", cmd_help)):
+                          ("clear", cmd_clear), ("usage", cmd_usage), ("help", cmd_help)):
         bot_app.add_handler(CommandHandler(name, handler))
     bot_app.add_handler(CallbackQueryHandler(on_parliament_button, pattern=r"^parl:"))
     bot_app.add_handler(CallbackQueryHandler(on_voice_button, pattern=r"^voice:"))
@@ -848,7 +858,7 @@ async def lifespan(app: FastAPI):
     bot_app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & MEDIA, handle_other))
     bot_app.add_error_handler(on_error)
     await bot_app.initialize()
-    await voices.load(bot_app.bot)
+    outdated = await voices.load(bot_app.bot)
     await bot_app.start()
     try:
         await set_webhook()
@@ -857,6 +867,8 @@ async def lifespan(app: FastAPI):
     loops = [asyncio.create_task(reminders_loop()), asyncio.create_task(memory_loop())]
     if public_url:
         loops.append(asyncio.create_task(voices.set_webhooks(voice_url, TELEGRAM_SECRET_TOKEN)))
+    if outdated:
+        loops.append(asyncio.create_task(voices.describe_again(outdated)))
     yield
     for task in loops:
         task.cancel()

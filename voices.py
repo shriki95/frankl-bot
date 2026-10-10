@@ -26,7 +26,9 @@ TOKEN_RE = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b")
 ALLOWED_UPDATES = ["message", "callback_query", "my_chat_member"]
 COMMANDS = [("profile", "מה שאני זוכר עליך"), ("goals", "היעדים שלך"), ("events", "חוטים פתוחים ויומן השיחות"),
             ("reminders", "מתי אני כותב לך ביוזמתי"), ("summary", "סיכום הדרך שעברנו"),
-            ("clear", "דף חדש (הזיכרון נשמר)"), ("help", "עזרה")]
+            ("clear", "דף חדש (הזיכרון נשמר)"), ("usage", "כמה טוקנים נוצלו"), ("help", "עזרה")]
+CHAIR_COMMANDS = [("usage", "כמה טוקנים נוצלו ומה זה עלה")]
+DESCRIBED = 2   # bump when names, descriptions or commands change - the bots are described again at startup
 
 main: Bot | None = None
 _bots: dict[str, Bot] = {}
@@ -112,14 +114,18 @@ def guess(bot):
 
 
 def _rows():
-    return db.fetchall("SELECT key, token FROM voices")
+    return db.fetchall("SELECT key, token, described FROM voices")
+
+
+def _described(key):
+    db.execute("UPDATE voices SET described = %s WHERE key = %s", (DESCRIBED, key))
 
 
 def _save(key, bot, token):
     def work(cur):
         cur.execute("DELETE FROM voices WHERE bot_id = %s OR key = %s", (bot.id, key))
-        cur.execute("INSERT INTO voices (key, token, bot_id, username) VALUES (%s, %s, %s, %s)",
-                    (key, token, bot.id, bot.username))
+        cur.execute("INSERT INTO voices (key, token, bot_id, username, described) VALUES (%s, %s, %s, %s, %s)",
+                    (key, token, bot.id, bot.username, DESCRIBED))
     db.run(work)
 
 
@@ -137,9 +143,11 @@ async def connect(token):
 
 
 async def load(main_bot):
-    """At startup: the main bot, and the persona bots saved in the database."""
+    """At startup: the main bot, and the persona bots saved in the database.
+    Returns the keys of bots whose name, description or commands are out of date."""
     global main
     main = main_bot
+    rows = await db.call(_rows)
 
     async def one(row):
         bot = await connect(row["token"])
@@ -147,8 +155,15 @@ async def load(main_bot):
             logger.error(f"The bot of {row['key']} was rejected by Telegram - the main bot speaks for him")
         else:
             _bots[row["key"]] = bot
-    await asyncio.gather(*(one(row) for row in await db.call(_rows)))
+    await asyncio.gather(*(one(row) for row in rows))
     logger.info(f"Persona bots: {sorted(_bots) or 'none yet'}")
+    return [row["key"] for row in rows if row["described"] < DESCRIBED and row["key"] in _bots]
+
+
+async def describe_again(keys):
+    for key in keys:
+        await _describe(key, _bots[key])
+        await db.call(_described, key)
 
 
 async def close():
@@ -174,7 +189,7 @@ async def _describe(key, bot):
     """His name, a description for the empty chat, and the commands of a private conversation."""
     if key == CHAIR:
         short = description = prompts.CHAIR_DESCRIPTION
-        commands = []
+        commands = CHAIR_COMMANDS
     else:
         persona = personas.BY_KEY[key]
         short = persona.domain

@@ -33,7 +33,7 @@ KEYS = [p.key for p in personas.ALL]
 
 @dataclass
 class Plan:
-    action: str = "respond"          # respond / brief / summary / stop / new_topic / none / more
+    action: str = "respond"          # respond / brief / summary / usage / stop / new_topic / none / more
     mode_change: str = "none"
     speakers: list = field(default_factory=list)
     recall: list = field(default_factory=list)
@@ -94,7 +94,7 @@ ROUTER_SCHEMA = {
     "type": "object",
     "properties": {
         "mode_change": {"type": "string", "enum": ["none", *MODES]},
-        "action": {"type": "string", "enum": ["respond", "brief", "summary", "stop", "new_topic", "none"]},
+        "action": {"type": "string", "enum": ["respond", "brief", "summary", "usage", "stop", "new_topic", "none"]},
         "speakers": {"type": "array", "items": {"type": "string", "enum": KEYS}},
         "recall": {"type": "array", "items": {"type": "string", "enum": KEYS}},
         "focus": {"type": "string"},
@@ -122,7 +122,8 @@ def mentioned(text, exclude=None):
 def fallback_plan(text):
     """Keyword routing, used when the router model is unavailable."""
     plan = Plan(speakers=mentioned(text))
-    rules = [("summary", r"סכמ|סכם|סיכום|מסקנ"), ("new_topic", r"נושא חדש|דף חדש"), ("stop", r"^(די|עצרו|מספיק)")]
+    rules = [("summary", r"סכמ|סכם|סיכום|מסקנ"), ("usage", r"טוקנ|כמה (זה )?עלה|עלויות"),
+             ("new_topic", r"נושא חדש|דף חדש"), ("stop", r"^(די|עצרו|מספיק)")]
     for action, pattern in rules:
         if re.search(pattern, text):
             plan.action = action
@@ -144,7 +145,7 @@ async def route(text, state, window, first_name) -> Plan:
     recent = memory.transcript([m for m in window if m["kind"] != "topic"][-6:], first_name)
     try:
         response = await llm.create(
-            model=llm.ROUTER_MODEL, max_tokens=2000, system=system,
+            purpose=PARLIAMENT, model=llm.ROUTER_MODEL, max_tokens=2000, system=system,
             messages=[{"role": "user", "content": f"Recent:\n{recent}\n\nLatest message from the user:\n{text}"}],
             output_config={"effort": "low", "format": {"type": "json_schema", "schema": ROUTER_SCHEMA}})
         data = json.loads(llm.text_of(response))
@@ -173,7 +174,7 @@ async def statement(user_id, first_name, key, turn, focus=""):
     ]
     # Same tools as in his private conversation, so the cached prompt prefix is shared with it.
     response = await llm.create(
-        model=llm.CHAT_MODEL, max_tokens=3000, system=system, tools=brain.TOOLS, tool_choice={"type": "none"},
+        purpose=PARLIAMENT, model=llm.CHAT_MODEL, max_tokens=3000, system=system, tools=brain.TOOLS, tool_choice={"type": "none"},
         messages=messages, output_config={"effort": llm.CHAT_EFFORT})
     if response.stop_reason == "refusal":
         return "", False
@@ -191,8 +192,8 @@ async def chair_summary(user_id, first_name):
         {"role": "user", "content": _meeting_text(notes, window, first_name)},
         {"role": "system", "content": f"עכשיו: {clock.describe_now()}\n{prompts.CHAIR_REQUEST}"},
     ]
-    response = await llm.create(model=llm.CHAT_MODEL, max_tokens=6000, system=system, messages=messages,
-                                output_config={"effort": "medium"})
+    response = await llm.create(purpose=PARLIAMENT, model=llm.CHAT_MODEL, max_tokens=6000, system=system,
+                                messages=messages, output_config={"effort": "medium"})
     return llm.text_of(response) if response.stop_reason != "refusal" else ""
 
 
@@ -263,7 +264,8 @@ async def debate(user_id, first_name, state, emit, focus="", first=None, last_sp
 async def respond(user_id, first_name, plan, emit, show=_no_show):
     """Carry out a plan. emit(speaker, text) sends and saves one message; show(speaker, True/False)
     marks who is writing right now.
-    Returns 'round' (show the meeting buttons), 'paused' (debate burst used up), 'silent', 'ack' or 'none'."""
+    Returns 'round' (show the meeting buttons), 'paused' (debate burst used up), 'silent', 'ack', 'usage'
+    (he asked what the meeting costs - the chair reports, outside the meeting record) or 'none'."""
     state = await db.call(get_state, user_id)
     changed = False
     if plan.mode_change in MODES and plan.mode_change != state["mode"]:
@@ -277,6 +279,8 @@ async def respond(user_id, first_name, plan, emit, show=_no_show):
     if changed:
         await db.call(save_state, user_id, state)
 
+    if plan.action == "usage":
+        return "usage"
     if plan.action == "new_topic":
         await memory.consolidate(user_id, PARLIAMENT)
         await db.call(memory.save_message, user_id, PARLIAMENT, "assistant", "", "topic", "chair")
