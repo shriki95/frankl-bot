@@ -592,8 +592,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if space.persona == PARLIAMENT:
         await handle_parliament(update, context, space)
         return
-    user = update.effective_user
-    message_id = await save_incoming(user, space.persona, update.effective_message.text)
+    await converse(update.effective_user, space, update.effective_message.text)
+
+
+async def converse(user, space, text):
+    """His message in a persona's private conversation, and the persona's answer."""
+    message_id = await save_incoming(user, space.persona, text)
     async with typing(space, lambda: [space.persona]):
         await asyncio.sleep(DEBOUNCE_SECONDS)
         async with brain.conversation_lock(user.id, space.persona):
@@ -609,6 +613,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await answer(space, reply)
             logger.info(f"Reply sent by {space.persona} ({len(reply)} chars)")
     memory.consolidate_soon(user.id, space.persona)
+
+
+def poll_text(poll):
+    """A poll as he would have written it: the question and the numbered options."""
+    options = "\n".join(f"{i}. {option.text}" for i, option in enumerate(poll.options, 1))
+    notes = ([prompts.POLL_MULTIPLE] if poll.allows_multiple_answers else []) + (
+        [prompts.POLL_QUIZ] if poll.type == "quiz" else [])
+    return "\n".join([prompts.POLL_MESSAGE.format(question=poll.question, options=options), *notes])
+
+
+async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """He sent a poll. Bots can't vote in Telegram polls, so each of them answers in words -
+    and in the parliament, the chair counts the votes."""
+    if not await is_allowed(update): return
+    space = await resolve(update, context)
+    if not space: return
+    user, poll = update.effective_user, update.effective_message.poll
+    if space.persona != PARLIAMENT:
+        await converse(user, space, poll_text(poll))
+        return
+    interrupt(user.id)
+    await save_incoming(user, PARLIAMENT, poll_text(poll))
+    plan = parliament.Plan(action="poll", poll={"question": poll.question, "options": [o.text for o in poll.options],
+                                                "multiple": poll.allows_multiple_answers})
+    await run_parliament(space, user, plan, update.effective_message)
 
 
 async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -855,6 +884,7 @@ async def lifespan(app: FastAPI):
     bot_app.add_handler(ChatMemberHandler(on_my_member, ChatMemberHandler.MY_CHAT_MEMBER))
     bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
     bot_app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND, handle_message))
+    bot_app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.POLL, handle_poll))
     bot_app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & MEDIA, handle_other))
     bot_app.add_error_handler(on_error)
     await bot_app.initialize()
