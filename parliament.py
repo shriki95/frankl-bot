@@ -33,7 +33,7 @@ KEYS = [p.key for p in personas.ALL]
 
 @dataclass
 class Plan:
-    action: str = "respond"          # respond / summary / stop / new_topic / none / more
+    action: str = "respond"          # respond / brief / summary / stop / new_topic / none / more
     mode_change: str = "none"
     speakers: list = field(default_factory=list)
     recall: list = field(default_factory=list)
@@ -94,7 +94,7 @@ ROUTER_SCHEMA = {
     "type": "object",
     "properties": {
         "mode_change": {"type": "string", "enum": ["none", *MODES]},
-        "action": {"type": "string", "enum": ["respond", "summary", "stop", "new_topic", "none"]},
+        "action": {"type": "string", "enum": ["respond", "brief", "summary", "stop", "new_topic", "none"]},
         "speakers": {"type": "array", "items": {"type": "string", "enum": KEYS}},
         "recall": {"type": "array", "items": {"type": "string", "enum": KEYS}},
         "focus": {"type": "string"},
@@ -179,6 +179,8 @@ async def statement(user_id, first_name, key, turn, focus=""):
         return "", False
     text = llm.text_of(response)
     left = prompts.LEAVE_MARK in text
+    if left:
+        logger.info(f"{key} walked out of the meeting")
     return text.replace(prompts.LEAVE_MARK, "").strip(), left
 
 
@@ -310,6 +312,12 @@ async def respond(user_id, first_name, plan, emit, show=_no_show):
         return "none"
 
     mode = state["mode"]
+    if plan.action == "brief":  # small talk: one of them answers, in turn - no round, no debate
+        key = speakers[0] if speakers else _next_in_rotation(state)
+        state["turn"] += 1
+        await db.call(save_state, user_id, state)
+        await _speak(user_id, first_name, state, key, prompts.TURN_BRIEF, plan.focus, emit, show)
+        return "round"
     if mode == "debate":
         return "paused" if await debate(user_id, first_name, state, emit, plan.focus,
                                         first=speakers[0] if speakers else None, show=show) else "round"
