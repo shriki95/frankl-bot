@@ -91,20 +91,21 @@ TOOLS = [
 # CONTEXT
 # ============================================================
 
-def persona_system(persona_key, first_name, memory_text, known_empty):
+def persona_system(persona_key, first_name, memory_text, known_empty, meetings=""):
     """System blocks: who the persona is (rarely changes), then what he knows about the user."""
     persona = personas.BY_KEY[persona_key]
+    known = prompts.MEMORY_BLOCK.format(first_name=first_name, memory=memory_text or known_empty)
     return [
         {"type": "text", "text": f"{persona.prompt}\n\n{prompts.COMMON}", "cache_control": CACHE_LONG},
-        {"type": "text", "text": prompts.MEMORY_BLOCK.format(first_name=first_name, memory=memory_text or known_empty),
-         "cache_control": CACHE},
+        {"type": "text", "text": f"{known}\n\n{meetings}" if meetings else known, "cache_control": CACHE},
     ]
 
 
-def _load(user_id, persona):
+def _load(user_id, persona, first_name):
     def work(cur):
         memory_text, cursor = memory.memory_state(cur, user_id, persona)
-        return memory_text, memory.window(cur, user_id, persona, cursor), reminders.settings(cur, user_id, persona)
+        return (memory_text, memory.window(cur, user_id, persona, cursor), reminders.settings(cur, user_id, persona),
+                memory.meetings(cur, user_id, persona, first_name))
     return db.run(work)
 
 
@@ -177,8 +178,8 @@ def empty_memory_text(window):
 
 
 async def _context(user_id, first_name, persona):
-    memory_text, window, settings = await db.call(_load, user_id, persona)
-    system = persona_system(persona, first_name, memory_text, empty_memory_text(window))
+    memory_text, window, settings, meetings = await db.call(_load, user_id, persona, first_name)
+    system = persona_system(persona, first_name, memory_text, empty_memory_text(window), meetings)
     window_start = window[0]["id"] if window else 2**62
     return system, window, settings, window_start
 

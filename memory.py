@@ -26,6 +26,8 @@ WINDOW_LIMIT = 40             # hard cap on verbatim messages sent to the model
 BATCH = 120                   # messages per memory update call
 MAX_MEMORY_CHARS = 10000      # above this the memory gets a compression pass
 RETRY_AFTER_FAILURE = 15 * 60
+MEETING_RECENT = 10           # latest parliament messages a persona carries into his private conversation
+MEETING_SNIPPET = 300         # characters kept from each of them
 
 _locks: dict[tuple, asyncio.Lock] = {}
 _last_failure: dict[tuple, float] = {}
@@ -124,6 +126,43 @@ def memory_state(cur, user_id, persona):
                 (user_id, persona))
     found = db.rows(cur)
     return (found[0]["memory"], found[0]["memory_cursor"]) if found else ("", 0)
+
+
+def meetings(cur, user_id, persona, first_name):
+    """What a persona remembers from the parliament: the meeting notes, and the latest part he was present for.
+    Shown in his private conversation (the other direction - private to the meeting - stays closed)."""
+    notes, cursor = memory_state(cur, user_id, personas.PARLIAMENT)
+    cur.execute("""
+        SELECT id, role, content, kind, speaker, created_at::timestamptz AS at FROM messages
+        WHERE user_id = %s AND persona = %s AND id > %s ORDER BY id DESC LIMIT %s
+    """, (user_id, personas.PARLIAMENT, cursor, MEETING_RECENT * 3))
+    recent = list(reversed(db.rows(cur)))
+    name = personas.BY_KEY[persona].name
+    left, back = prompts.MEMBER_LEFT.format(name=name), prompts.MEMBER_RETURNED.format(name=name)
+    cur.execute("SELECT absent FROM parliament WHERE user_id = %s", (user_id,))
+    found = cur.fetchone()
+    absent_now = bool(found) and persona in found[0].split(",")
+    first_event = next((m["content"] for m in recent if m["content"] in (left, back)), None)
+    present = first_event == left if first_event else not absent_now
+    attended = []
+    for m in recent:
+        if m["kind"] == "topic":
+            present = True
+        elif m["content"] == left:
+            attended.append(m)
+            present = False
+        elif m["content"] == back:
+            present = True
+        elif present:
+            attended.append(m)
+    attended = [{**m, "content": m["content"] if len(m["content"]) <= MEETING_SNIPPET
+                 else m["content"][:MEETING_SNIPPET] + "..."} for m in attended[-MEETING_RECENT:]]
+    if not notes and not attended:
+        return ""
+    parts = [notes] if notes else []
+    if attended:
+        parts.append("מהישיבה האחרונה:\n" + transcript(attended, first_name))
+    return prompts.MEETINGS_BLOCK.format(meetings="\n\n".join(parts))
 
 
 def _legacy_notes(cur, user_id):
