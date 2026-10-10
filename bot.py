@@ -410,13 +410,38 @@ async def on_voice_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_my_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """A persona's bot was added to a group."""
+    """One of the bots was added to a group: by him - welcome; by anyone else - it leaves at once."""
     change = update.my_chat_member
-    key = voices.key_of(update.get_bot())
-    if key in (None, voices.MAIN) or change.from_user.id != ALLOWED_USER_ID or change.chat.type == "private":
+    if change.chat.type == "private" or change.new_chat_member.status not in ("member", "administrator"):
         return
-    if change.new_chat_member.status in ("member", "administrator") and await db.call(spaces.in_chat, change.chat.id):
+    bot = update.get_bot()
+    if change.from_user.id != ALLOWED_USER_ID:
+        logger.warning(f"Someone else added a bot to chat {change.chat.id} - leaving it")
+        with contextlib.suppress(Exception):
+            await bot.leave_chat(change.chat.id)
+        return
+    key = voices.key_of(bot)
+    if key not in (None, voices.MAIN) and await db.call(spaces.in_chat, change.chat.id):
         await voice_joined(key, change.chat.id, change.from_user.id)
+
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """His group is his alone: anyone else who joins is removed (bots he adds may stay)."""
+    message = update.effective_message
+    if not await db.call(spaces.in_chat, message.chat_id):
+        return
+    for member in message.new_chat_members:
+        if member.is_bot or member.id == ALLOWED_USER_ID:
+            continue
+        try:
+            await bot_app.bot.ban_chat_member(message.chat_id, member.id)
+            await bot_app.bot.unban_chat_member(message.chat_id, member.id)  # removed, not banned for good
+        except Exception as error:
+            logger.error(f"Couldn't remove a stranger from the group: {error!r}")
+            continue
+        logger.warning(f"Removed a stranger ({member.id}) from the group")
+        await post(Space(message.chat_id, None, PARLIAMENT), voices.CHAIR,
+                   prompts.STRANGER_REMOVED.format(name=member.full_name), sign=False)
 
 # ============================================================
 # COMMANDS
@@ -818,6 +843,7 @@ async def lifespan(app: FastAPI):
     bot_app.add_handler(CallbackQueryHandler(on_parliament_button, pattern=r"^parl:"))
     bot_app.add_handler(CallbackQueryHandler(on_voice_button, pattern=r"^voice:"))
     bot_app.add_handler(ChatMemberHandler(on_my_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    bot_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
     bot_app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND, handle_message))
     bot_app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & MEDIA, handle_other))
     bot_app.add_error_handler(on_error)

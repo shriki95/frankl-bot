@@ -320,6 +320,7 @@ VOICE_IN_GROUP = "הוא כבר בקבוצה, ומעכשיו כותב שם בש�
 VOICE_ADD_TO_GROUP = "עכשיו הוסף את @{username} לקבוצה (Add Members). חבר רגיל - לא צריך להיות מנהל."
 VOICE_REMAINING = "נשארו: {names}."
 VOICE_ALL_DONE = "כולם מחוברים 🎉"
+STRANGER_REMOVED = "🔒 {name} הצטרף לקבוצה והוצאתי אותו. כאן רק אתה והיועצים."
 
 PRIVATE_BOT = "הבוט הזה פרטי."
 ERROR_TEXT = "סליחה, נתקלתי בבעיה טכנית. נסה שוב."
