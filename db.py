@@ -181,6 +181,23 @@ SCHEMA = [
         turn INT NOT NULL DEFAULT 0,
         absent TEXT NOT NULL DEFAULT ''
     )""",
+    # --- every persona speaks through a bot of his own ---
+    """CREATE TABLE IF NOT EXISTS voices (
+        key VARCHAR(20) PRIMARY KEY,
+        token TEXT NOT NULL,
+        bot_id BIGINT NOT NULL,
+        username VARCHAR(64),
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    # voiced: the topic was opened with the persona's own bot (an older one was opened by the main bot).
+    "ALTER TABLE spaces ADD COLUMN IF NOT EXISTS voiced BOOLEAN NOT NULL DEFAULT FALSE",
+    "UPDATE spaces SET voiced = TRUE WHERE persona = 'frankl' AND NOT voiced",
+    # The pinned guide in each group, so it can be kept up to date.
+    """CREATE TABLE IF NOT EXISTS forums (
+        chat_id BIGINT PRIMARY KEY,
+        guide_message_id BIGINT NOT NULL,
+        guide_by VARCHAR(20) NOT NULL
+    )""",
 ]
 
 
