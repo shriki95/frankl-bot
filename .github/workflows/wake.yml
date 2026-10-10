@@ -6,6 +6,9 @@ on:
   schedule:
     - cron: "41 * * * *"
   workflow_dispatch:
+  push:  # also run once whenever this file changes - shows right away that Actions is working
+    branches: [master]
+    paths: [.github/workflows/wake.yml]
 
 permissions:
   actions: write
