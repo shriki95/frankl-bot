@@ -7,17 +7,11 @@ CHAT_MODEL = os.environ.get("MODEL", "claude-sonnet-5-5")
 MEMORY_MODEL = os.environ.get("MEMORY_MODEL", CHAT_MODEL)
 CHAT_EFFORT = os.environ.get("CHAT_EFFORT", "low")
 
-# Server-side fallback: if a safety classifier declines a request, the API re-runs it
-# on a recommended model instead of returning the refusal.
-_FALLBACK_MODELS = {"claude-sonnet-5-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1"}
-_FALLBACK_BETA = "server-side-fallback-2026-07-01"
-
 client = anthropic.AsyncAnthropic(timeout=120.0)
 
 
 async def create(**params):
-    if params["model"] in _FALLBACK_MODELS:
-        params.update(betas=[_FALLBACK_BETA], fallbacks="default")
+    # The beta namespace accepts mid-conversation system messages (the current time and context).
     return await client.beta.messages.create(**params)
 
 

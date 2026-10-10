@@ -225,7 +225,7 @@ async def reply(user_id, first_name) -> str:
         tool_calls = [block for block in response.content if block.type == "tool_use"]
         if response.stop_reason != "tool_use" or not tool_calls:
             break
-        messages.append({"role": "assistant", "content": [b for b in response.content if b.type != "fallback"]})
+        messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": [
             await _run_tool(user_id, first_name, window_start, block) for block in tool_calls]})
     return "\n\n".join(text for text in texts if text) or prompts.ERROR_TEXT
