@@ -1,4 +1,4 @@
-"""Frankl's conversation engine: builds what Claude sees and runs the tool loop."""
+"""The personas' conversation engine: builds what Claude sees and runs the tool loop."""
 import asyncio
 import logging
 
@@ -6,6 +6,7 @@ import clock
 import db
 import llm
 import memory
+import personas
 import prompts
 import reminders
 
@@ -13,13 +14,15 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 4
 CACHE = {"type": "ephemeral"}
+# The persona's own prompt never changes - keep it cached between conversations that are minutes apart.
+CACHE_LONG = {"type": "ephemeral", "ttl": "1h"}
 
-_conversation_locks: dict[int, asyncio.Lock] = {}
+_conversation_locks: dict[tuple, asyncio.Lock] = {}
 
 
-def conversation_lock(user_id) -> asyncio.Lock:
-    """One reply (or proactive message) at a time per user."""
-    return _conversation_locks.setdefault(user_id, asyncio.Lock())
+def conversation_lock(user_id, persona) -> asyncio.Lock:
+    """One reply (or proactive message) at a time per conversation."""
+    return _conversation_locks.setdefault((user_id, persona), asyncio.Lock())
 
 
 TOOLS = [
@@ -88,16 +91,24 @@ TOOLS = [
 # CONTEXT
 # ============================================================
 
-def _load(user_id):
+def persona_system(persona_key, first_name, memory_text, known_empty):
+    """System blocks: who the persona is (rarely changes), then what he knows about the user."""
+    persona = personas.BY_KEY[persona_key]
+    return [
+        {"type": "text", "text": f"{persona.prompt}\n\n{prompts.COMMON}", "cache_control": CACHE_LONG},
+        {"type": "text", "text": prompts.MEMORY_BLOCK.format(first_name=first_name, memory=memory_text or known_empty),
+         "cache_control": CACHE},
+    ]
+
+
+def _load(user_id, persona):
     def work(cur):
-        cur.execute("SELECT memory, memory_cursor FROM users WHERE user_id = %s", (user_id,))
-        found = db.rows(cur)
-        user = found[0] if found else {"memory": "", "memory_cursor": 0}
-        return user["memory"], memory.window(cur, user_id, user["memory_cursor"]), reminders.settings(cur, user_id)
+        memory_text, cursor = memory.memory_state(cur, user_id, persona)
+        return memory_text, memory.window(cur, user_id, persona, cursor), reminders.settings(cur, user_id, persona)
     return db.run(work)
 
 
-def _history(window):
+def history(window):
     """API messages from stored ones: starts with the user, consecutive turns of one role merged."""
     messages = []
     for m in window:
@@ -129,10 +140,10 @@ def _settings_lines(settings):
     return lines
 
 
-def _note(window, settings, replying):
-    """Fresh context for this moment - sent after the conversation, so the cached prefix stays intact."""
+def time_lines(window, replying):
+    """The current time, and how long since the conversation last moved."""
     now = clock.now()
-    lines = ["[הקשר עדכני מהמערכת - לא הודעה ממנו]", f"עכשיו: {clock.describe_now(now)}"]
+    lines = [f"עכשיו: {clock.describe_now(now)}"]
     earlier = list(window)
     if replying:
         while earlier and earlier[-1]["role"] == "user":  # his current message(s)
@@ -152,21 +163,22 @@ def _note(window, settings, replying):
         if unanswered >= reminders.MAX_UNANSWERED:
             lines.append(f"{unanswered} ההודעות האחרונות ששלחת לו ביוזמתך נשארו בלי מענה. "
                          "אם זה מתאים - בדוק בעדינות אם הקצב מתאים לו.")
-    lines += _settings_lines(settings)
-    return "\n".join(lines)
+    return lines
 
 
-async def _context(user_id, first_name):
-    memory_text, window, settings = await db.call(_load, user_id)
-    if memory_text:
-        known = memory_text
-    else:
-        known = prompts.MEMORY_EMPTY_EARLY if len(window) > 1 else prompts.MEMORY_EMPTY_FIRST
-    system = [
-        {"type": "text", "text": prompts.FRANKL_BASE, "cache_control": CACHE},
-        {"type": "text", "text": prompts.MEMORY_BLOCK.format(first_name=first_name, memory=known),
-         "cache_control": CACHE},
-    ]
+def _note(window, settings, replying):
+    """Fresh context for this moment - sent after the conversation, so the cached prefix stays intact."""
+    return "\n".join(["[הקשר עדכני מהמערכת - לא הודעה ממנו]"] + time_lines(window, replying)
+                     + _settings_lines(settings))
+
+
+def empty_memory_text(window):
+    return prompts.MEMORY_EMPTY_EARLY if len(window) > 1 else prompts.MEMORY_EMPTY_FIRST
+
+
+async def _context(user_id, first_name, persona):
+    memory_text, window, settings = await db.call(_load, user_id, persona)
+    system = persona_system(persona, first_name, memory_text, empty_memory_text(window))
     window_start = window[0]["id"] if window else 2**62
     return system, window, settings, window_start
 
@@ -175,22 +187,23 @@ async def _context(user_id, first_name):
 # TOOLS
 # ============================================================
 
-async def _run_tool(user_id, first_name, window_start, block):
+async def _run_tool(user_id, first_name, persona, window_start, block):
     args = block.input
     name = block.name.lower()
     try:
         if name == "search_past_conversations":
-            result = await db.call(memory.search, user_id, first_name, args["query"], window_start)
+            result = await db.call(memory.search, user_id, persona, first_name, args["query"], window_start)
         elif name == "schedule_message":
-            result = await db.call(reminders.schedule, user_id, args["when"], args["purpose"],
+            result = await db.call(reminders.schedule, user_id, persona, args["when"], args["purpose"],
                                    args["requested_by_user"])
         elif name == "cancel_scheduled_message":
-            result = await db.call(reminders.cancel, user_id, args["id"])
+            result = await db.call(reminders.cancel, user_id, persona, args["id"])
         elif name == "set_checkin_preferences":
-            result = await db.call(reminders.set_preferences, user_id, args["daily_time"], args["followups"])
+            result = await db.call(reminders.set_preferences, user_id, persona, args["daily_time"],
+                                   args["followups"])
         else:
             raise reminders.Rejected(f"אין כלי בשם {block.name}.")
-        logger.info(f"Tool {name} for user {user_id}: {result[:200]}")
+        logger.info(f"Tool {name} for {persona}/{user_id}: {result[:200]}")
         return {"type": "tool_result", "tool_use_id": block.id, "content": result}
     except reminders.Rejected as e:
         return {"type": "tool_result", "tool_use_id": block.id, "content": str(e), "is_error": True}
@@ -203,10 +216,10 @@ async def _run_tool(user_id, first_name, window_start, block):
 # CONVERSATION
 # ============================================================
 
-async def reply(user_id, first_name) -> str:
-    """Frankl's answer to the latest message(s), with tools available."""
-    system, window, settings, window_start = await _context(user_id, first_name)
-    messages = _history(window)
+async def reply(user_id, first_name, persona) -> str:
+    """The persona's answer to the latest message(s), with tools available."""
+    system, window, settings, window_start = await _context(user_id, first_name, persona)
+    messages = history(window)
     if not messages or messages[-1]["role"] != "user":
         # A proactive message went out between his message and this reply.
         messages.append({"role": "user", "content": prompts.REPLY_AFTER_PROACTIVE})
@@ -227,20 +240,20 @@ async def reply(user_id, first_name) -> str:
             break
         messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": [
-            await _run_tool(user_id, first_name, window_start, block) for block in tool_calls]})
+            await _run_tool(user_id, first_name, persona, window_start, block) for block in tool_calls]})
     return "\n\n".join(text for text in texts if text) or prompts.ERROR_TEXT
 
 
 async def compose_proactive(user_id, first_name, reminder) -> str:
-    """A message Frankl sends on his own. Empty string if nothing could be written."""
+    """A message a persona sends on his own. Empty string if nothing could be written."""
     if reminder["kind"] == "daily":
         instruction = prompts.PROACTIVE_DAILY
     elif reminder["requested_by"] == "user":
         instruction = prompts.PROACTIVE_USER_REMINDER.format(purpose=reminder["purpose"])
     else:
         instruction = prompts.PROACTIVE_FOLLOWUP.format(purpose=reminder["purpose"])
-    system, window, settings, _ = await _context(user_id, first_name)
-    messages = _history(window)
+    system, window, settings, _ = await _context(user_id, first_name, reminder["persona"])
+    messages = history(window)
     if not messages or messages[-1]["role"] != "user":
         messages.append({"role": "user", "content": prompts.PROACTIVE_NO_NEW_MESSAGE})
     messages.append({"role": "system", "content": _note(window, settings, replying=False) + "\n\n" + instruction})
@@ -253,9 +266,9 @@ async def compose_proactive(user_id, first_name, reminder) -> str:
     return llm.text_of(response)
 
 
-async def summarize(user_id, first_name) -> str:
-    system, window, settings, _ = await _context(user_id, first_name)
-    messages = _history(window) + [
+async def summarize(user_id, first_name, persona) -> str:
+    system, window, settings, _ = await _context(user_id, first_name, persona)
+    messages = history(window) + [
         {"role": "user", "content": prompts.SUMMARY_REQUEST},
         {"role": "system", "content": _note(window, settings, replying=False)},
     ]
