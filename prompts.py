@@ -250,6 +250,7 @@ Fields:
   "respond" = someone should speak now (default);
   "brief" = small talk that needs no discussion (a greeting, thanks, a quick personal remark): one advisor answers briefly, whatever the mode;
   "summary" = the user asks to sum up, conclude, list scenarios or decide;
+  "usage" = the user asks how many tokens were used or what the conversations cost;
   "stop" = the user tells them to stop or be quiet right now, without a new question;
   "new_topic" = the user wants to start a new topic or clear the table;
   "none" = nobody should speak (e.g. silent mode and nobody was addressed, or the message only changes the mode).
@@ -304,6 +305,7 @@ HELP_TEXT = """/profile - מה שאני זוכר עליך
 /reminders - מתי אני כותב לך ביוזמתי
 /summary - סיכום (בפרלמנט: סיכום הישיבה)
 /clear - דף חדש (הזיכרון נשמר)
+/usage - כמה טוקנים נוצלו ומה זה עלה
 /setup - פתיחת השיחות בקבוצה עם נושאים
 /help - עזרה"""
 
@@ -311,8 +313,8 @@ HELP_TEXT = """/profile - מה שאני זוכר עליך
 # A BOT FOR EVERY PERSONA
 # ============================================================
 
-CHAIR_DESCRIPTION = "🏛️ יו״ר ישיבות הפרלמנט: מסכם את הדיונים ומודיע מה קורה בישיבה."
-CHAIR_PRIVATE = "אני עובד רק בישיבות הפרלמנט שבקבוצה. לשיחה אישית - פנה לאחד היועצים."
+CHAIR_DESCRIPTION = ("🏛️ יו״ר ישיבות הפרלמנט: מסכם את הדיונים ומודיע מה קורה בישיבה. "
+                     "כאן בפרטי - כל הודעה אליי מחזירה דוח צריכת טוקנים.")
 VOICE_BAD_TOKEN = "הטוקן הזה לא עובד. תעביר לי שוב את ההודעה מ-BotFather, בדיוק כמו שהיא."
 VOICE_IS_MAIN = "זה הטוקן שלי 🙂 צריך את הטוקן של בוט חדש."
 VOICE_WHO = "למי שייך הבוט @{username}?"
@@ -323,6 +325,22 @@ VOICE_ADD_TO_GROUP = "עכשיו הוסף את @{username} לקבוצה (Add Mem
 VOICE_REMAINING = "נשארו: {names}."
 VOICE_ALL_DONE = "כולם מחוברים 🎉"
 STRANGER_REMOVED = "🔒 {name} הצטרף לקבוצה והוצאתי אותו. כאן רק אתה והיועצים."
+
+# ============================================================
+# TOKEN USAGE - the chair reports it
+# ============================================================
+
+USAGE_TITLE = "📊 צריכת טוקנים"
+USAGE_LINE = "{label}: {tokens} טוקנים · {cost}"
+USAGE_BY_PART = "החודש, לפי שיחה:"
+USAGE_PART = "• {name}: {cost} ({tokens} טוקנים)"
+USAGE_PARLIAMENT = "🏛️ הפרלמנט (כולל ניתוב וסיכומים)"
+USAGE_MEMORY = "🗂️ עדכוני זיכרון"
+USAGE_OTHER = "אחר"
+USAGE_UNDER_CENT = "פחות מסנט"
+USAGE_CACHE = "המטמון חסך החודש כ-{saved} ({share}% מהקלט נקרא מהמטמון, בעשירית מחיר)."
+USAGE_FOOTER = "הערכה לפי מחירון Anthropic, מאז {since}. החשבון המדויק: console.anthropic.com"
+USAGE_EMPTY = "📊 עדיין אין נתונים - אני סופר מעכשיו כל פנייה ל-Claude."
 
 PRIVATE_BOT = "הבוט הזה פרטי."
 ERROR_TEXT = "סליחה, נתקלתי בבעיה טכנית. נסה שוב."

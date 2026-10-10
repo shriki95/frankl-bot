@@ -231,7 +231,7 @@ def _instructions(persona):
 async def _ask(system, messages):
     # The whole document is rewritten (Hebrew is token-heavy), plus thinking - leave room for both.
     response = await llm.create(
-        model=llm.MEMORY_MODEL, max_tokens=16000, system=system, messages=messages,
+        purpose="memory", model=llm.MEMORY_MODEL, max_tokens=16000, system=system, messages=messages,
         output_config={"effort": llm.MEMORY_EFFORT}, timeout=300)
     if response.stop_reason in ("refusal", "max_tokens"):
         raise RuntimeError(f"memory update stopped: {response.stop_reason}")

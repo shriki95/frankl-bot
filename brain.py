@@ -229,7 +229,7 @@ async def reply(user_id, first_name, persona) -> str:
     for round_number in range(MAX_TOOL_ROUNDS):
         last_round = round_number == MAX_TOOL_ROUNDS - 1
         response = await llm.create(
-            model=llm.CHAT_MODEL, max_tokens=4000, system=system, tools=TOOLS,
+            purpose=persona, model=llm.CHAT_MODEL, max_tokens=4000, system=system, tools=TOOLS,
             tool_choice={"type": "none" if last_round else "auto"},
             messages=messages, output_config={"effort": llm.CHAT_EFFORT})
         if response.stop_reason == "refusal":
@@ -259,7 +259,8 @@ async def compose_proactive(user_id, first_name, reminder) -> str:
         messages.append({"role": "user", "content": prompts.PROACTIVE_NO_NEW_MESSAGE})
     messages.append({"role": "system", "content": _note(window, settings, replying=False) + "\n\n" + instruction})
     response = await llm.create(
-        model=llm.CHAT_MODEL, max_tokens=2000, system=system, tools=TOOLS, tool_choice={"type": "none"},
+        purpose=reminder["persona"], model=llm.CHAT_MODEL, max_tokens=2000, system=system, tools=TOOLS,
+        tool_choice={"type": "none"},
         messages=messages, output_config={"effort": llm.CHAT_EFFORT})
     if response.stop_reason == "refusal":
         logger.warning(f"Proactive message declined: {response.stop_details}")
@@ -274,7 +275,8 @@ async def summarize(user_id, first_name, persona) -> str:
         {"role": "system", "content": _note(window, settings, replying=False)},
     ]
     response = await llm.create(
-        model=llm.CHAT_MODEL, max_tokens=6000, system=system, tools=TOOLS, tool_choice={"type": "none"},
+        purpose=persona, model=llm.CHAT_MODEL, max_tokens=6000, system=system, tools=TOOLS,
+        tool_choice={"type": "none"},
         messages=messages, output_config={"effort": "medium"})
     if response.stop_reason == "refusal":
         return prompts.REFUSAL_TEXT

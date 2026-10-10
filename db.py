@@ -192,6 +192,22 @@ SCHEMA = [
     # voiced: the topic was opened with the persona's own bot (an older one was opened by the main bot).
     "ALTER TABLE spaces ADD COLUMN IF NOT EXISTS voiced BOOLEAN NOT NULL DEFAULT FALSE",
     "UPDATE spaces SET voiced = TRUE WHERE persona = 'frankl' AND NOT voiced",
+    # Every call to Claude: tokens and estimated cost (usage.py).
+    """CREATE TABLE IF NOT EXISTS usage (
+        id SERIAL PRIMARY KEY,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        purpose VARCHAR(20) NOT NULL,
+        model VARCHAR(40) NOT NULL,
+        fresh_input INT NOT NULL,
+        cache_read INT NOT NULL,
+        cache_write_5m INT NOT NULL,
+        cache_write_1h INT NOT NULL,
+        output_tokens INT NOT NULL,
+        cost DOUBLE PRECISION NOT NULL,
+        full_cost DOUBLE PRECISION NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS usage_created_at_idx ON usage (created_at)",
+    "ALTER TABLE voices ADD COLUMN IF NOT EXISTS described INT NOT NULL DEFAULT 1",
     # The pinned guide in each group, so it can be kept up to date.
     """CREATE TABLE IF NOT EXISTS forums (
         chat_id BIGINT PRIMARY KEY,
