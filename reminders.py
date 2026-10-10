@@ -204,6 +204,13 @@ def decide(reminder, now, last_user_age, unanswered):
     return "send"
 
 
+def due_soon(within):
+    """Whether a scheduled message is due within `within` (or already due)."""
+    row = db.fetchone("SELECT EXISTS (SELECT 1 FROM reminders WHERE status = 'pending' "
+                      "AND due_at <= NOW() + %s) AS soon", (within,))
+    return row["soon"]
+
+
 def finish(reminder_id, status):
     db.execute("""
         UPDATE reminders SET status = %s, sent_at = CASE WHEN %s = 'sent' THEN NOW() END

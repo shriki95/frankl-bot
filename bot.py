@@ -1,6 +1,7 @@
 import asyncio
 import collections
 import contextlib
+import datetime
 import hashlib
 import hmac
 import html
@@ -33,6 +34,7 @@ ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "1126985722"))
 DEBOUNCE_SECONDS = 2.0       # wait for a burst of short messages before answering them together
 TELEGRAM_LIMIT = 4000
 KEEP_AWAKE_SECONDS = 10 * 60
+WAKE_LOOKAHEAD = datetime.timedelta(minutes=90)  # longer than the gap between hourly wake-up pings
 LEAKED_SECRETS = {"frankl2024secret"}  # the old default, visible in the public repo
 
 
@@ -53,8 +55,10 @@ TELEGRAM_SECRET_TOKEN = hashlib.sha256(f"telegram:{WEBHOOK_SECRET}".encode()).he
 public_url = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL")
               or (f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}" if os.environ.get("RAILWAY_PUBLIC_DOMAIN") else "")
               ).rstrip("/")
-# Render's free plan sleeps after 15 idle minutes, which would stop scheduled messages. A periodic
-# request to our own address keeps it awake.
+# Render's free plan sleeps after 15 idle minutes. A GitHub Actions ping wakes the bot every hour
+# (.github/workflows/wake.yml); when a scheduled message is due soon, the bot pings its own address
+# to stay awake until it is sent. Staying awake all the time would use up the free plan's monthly
+# hours, which are shared with the account's other free services.
 KEEP_AWAKE = os.environ.get("KEEP_AWAKE", "1" if os.environ.get("RENDER_EXTERNAL_URL") else "0") == "1"
 
 bot_app: Application = None
@@ -299,7 +303,8 @@ async def reminders_loop():
     while True:
         try:
             await run_due_reminders()
-            if KEEP_AWAKE and public_url and time.monotonic() - last_ping > KEEP_AWAKE_SECONDS:
+            if (KEEP_AWAKE and public_url and time.monotonic() - last_ping > KEEP_AWAKE_SECONDS
+                    and await db.call(reminders.due_soon, WAKE_LOOKAHEAD)):
                 last_ping = time.monotonic()
                 async with httpx.AsyncClient(timeout=30) as client:
                     await client.get(f"{public_url}/health")

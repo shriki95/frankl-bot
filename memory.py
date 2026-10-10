@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 CONSOLIDATE_AFTER = 12        # unsummarized messages that trigger a memory update (~6 exchanges)
 IDLE_CONSOLIDATE_AFTER = 4    # after a pause, fold in even a short conversation
-IDLE_SECONDS = 30 * 60
+IDLE_SECONDS = 10 * 60         # before Render's free plan puts the bot to sleep (15 idle minutes)
 OVERLAP = 6                   # already-summarized messages still shown verbatim, for continuity
 WINDOW_LIMIT = 40             # hard cap on verbatim messages sent to the model
 BATCH = 120                   # messages per memory update call
